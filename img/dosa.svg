@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
-  <rect x="10" y="36" width="76" height="24" rx="12" fill="#f5c374" stroke="#c27c2c" stroke-width="2"/>
-  <rect x="6" y="60" width="84" height="8" rx="4" fill="#9acd32" opacity=".8"/>
-  <text x="48" y="30" text-anchor="middle" font-family="system-ui, Arial" font-size="10" font-weight="700" fill="#8a4b08">DOSA</text>
+  <rect x="10" y="36" width="76" height="24" rx="12" fill="#f4c56d" stroke="#b07622" stroke-width="2"/>
+  <rect x="6" y="60" width="84" height="8" rx="4" fill="#80d16f" opacity=".9"/>
+  <text x="48" y="30" text-anchor="middle" font-family="system-ui, Arial" font-size="11" font-weight="800" fill="#8a4b08">DOSA</text>
 </svg>
 
