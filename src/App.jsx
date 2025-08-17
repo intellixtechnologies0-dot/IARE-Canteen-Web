@@ -217,22 +217,7 @@ function DashboardShell() {
         <header className="topbar">
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <h1 style={{ margin: 0 }}>{title}</h1>
-            <div style={{ 
-              padding: '4px 8px', 
-              borderRadius: '4px', 
-              fontSize: '12px', 
-              fontWeight: 'bold',
-              backgroundColor: connectionStatus === 'connected' ? '#10b981' : 
-                             connectionStatus === 'connecting' ? '#f59e0b' : 
-                             connectionStatus === 'error' ? '#ef4444' : 
-                             connectionStatus === 'not-configured' ? '#8b5cf6' : '#6b7280',
-              color: 'white'
-            }}>
-              {connectionStatus === 'connected' ? '🟢 Connected' : 
-               connectionStatus === 'connecting' ? '🟡 Connecting...' : 
-               connectionStatus === 'error' ? '🔴 Error' : 
-               connectionStatus === 'not-configured' ? '⚙️ Not Configured' : '⚪ Checking...'}
-            </div>
+            {/* connection status indicator removed per request */}
           </div>
           {location.pathname === '/orders' && (
             <div className="actions" style={{ justifyContent: 'center' }}>
@@ -596,6 +581,9 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {} 
                 )}
                 {normStatus(o.status) === 'PREPARING' && (
                   <button className="btn" onClick={() => onUpdateStatus(o.id, 'READY')}>Mark Ready</button>
+                )}
+                {normStatus(o.status) === 'READY' && (
+                  <button className="btn" onClick={() => onUpdateStatus(o.id, 'DELIVERED')}>Mark Delivered</button>
                 )}
               </td>
             </tr>
@@ -1360,5 +1348,4 @@ function DebugPanel() {
     </div>
   )
 }
-
 
