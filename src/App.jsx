@@ -34,6 +34,8 @@ function DashboardShell() {
   const [activity, setActivity] = useState([]) // {orderId, items, from, to, at, prevLoc, nextLoc}
 
   const updateOrderStatus = async (orderId, nextStatus) => {
+    // Optimistic UI update: show new status immediately so buttons reflect the change
+    setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, status: nextStatus } : o)))
     // Persist status via RPC, then update local UI
     try {
       // send lowercase status to the DB RPC (DB stores statuses lowercase)
