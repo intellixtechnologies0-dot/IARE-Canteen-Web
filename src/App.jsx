@@ -1,13 +1,44 @@
 import './App.css'
 import { NavLink, Route, Routes, useLocation } from 'react-router-dom'
-import { useEffect, useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import supabase from './lib/supabaseClient'
 
 // Normalize status for UI comparisons (handles lowercase/uppercase from DB)
 const normStatus = (s) => String(s || '').toUpperCase()
 
 export default function App() {
-  return <DashboardShell />
+  return (
+    <ErrorBoundary>
+      <DashboardShell />
+    </ErrorBoundary>
+  )
+}
+
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props)
+    this.state = { hasError: false, error: null }
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error }
+  }
+
+  componentDidCatch(error, info) {
+    console.error('Unhandled error in App:', error, info)
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: 24 }}>
+          <h2>Application error</h2>
+          <pre style={{ whiteSpace: 'pre-wrap', color: 'crimson' }}>{String(this.state.error)}</pre>
+        </div>
+      )
+    }
+    return this.props.children
+  }
 }
 
 function DashboardShell() {
@@ -34,49 +65,48 @@ function DashboardShell() {
   const [activity, setActivity] = useState([]) // {orderId, items, from, to, at, prevLoc, nextLoc}
 
   const updateOrderStatus = async (orderId, nextStatus) => {
-    // Optimistic UI update: show new status immediately so buttons reflect the change
+    // Snapshot current orders to avoid stale closures and allow rollback
+    const prevOrdersSnapshot = [...orders]
+    // Optimistic UI update to give immediate feedback
     setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, status: nextStatus } : o)))
-    // Persist status via RPC, then update local UI
+
     try {
-      // send lowercase status to the DB RPC (DB stores statuses lowercase)
+      // Persist status via RPC
       const { data, error } = await supabase.rpc('update_order_status', {
         p_order_id: orderId,
         p_new_status: String(nextStatus).toLowerCase(),
       })
-
       if (error) throw error
 
-      // Update local state based on previous behavior
-      const current = orders.find((o) => o.id === orderId)
-      if (!current) return
-      const prevStatus = current.status
+      // Locate the order from the snapshot (fallback to latest state)
+      const found = prevOrdersSnapshot.find((o) => o.id === orderId) || orders.find((o) => o.id === orderId)
+      if (!found) return
+      const prevStatus = found.status
       const now = new Date().toLocaleString()
 
-      // Handle READY and DELIVERED as separate transitions
+      // Handle transitions
       if (nextStatus === 'READY') {
-        // update order status in-place (remain in live orders until delivered)
         setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, status: 'READY' } : o)))
         setRecent((prev) => {
           const pruned = prev.filter((e) => !(e.orderId === orderId && e.to === 'PREPARING'))
-          return [{ orderId, itemName: current.item_name, from: prevStatus, to: 'READY', ts: Date.now() }, ...pruned]
+          return [{ orderId, itemName: found.item_name, from: prevStatus, to: 'READY', ts: Date.now() }, ...pruned]
         })
         setActivity((a) => [
-          { orderId, itemName: current.item_name, from: prevStatus, to: 'READY', at: now, ts: Date.now(), prevLoc: 'live', nextLoc: 'live' },
+          { orderId, itemName: found.item_name, from: prevStatus, to: 'READY', at: now, ts: Date.now(), prevLoc: 'live', nextLoc: 'live' },
           ...a.filter((e) => !(e.orderId === orderId && e.to === 'PREPARING')),
         ])
         return
       }
 
       if (nextStatus === 'DELIVERED') {
-        // move to delivered list and remove from live orders
         setOrders((prev) => prev.filter((o) => o.id !== orderId))
-        setDelivered((d) => [{ ...current, status: 'DELIVERED', deliveredAt: Date.now() }, ...d])
+        setDelivered((d) => [{ ...found, status: 'DELIVERED', deliveredAt: Date.now() }, ...d])
         setRecent((prev) => {
           const pruned = prev.filter((e) => !(e.orderId === orderId && e.to === 'PREPARING'))
-          return [{ orderId, itemName: current.item_name, from: prevStatus, to: 'DELIVERED', ts: Date.now() }, ...pruned]
+          return [{ orderId, itemName: found.item_name, from: prevStatus, to: 'DELIVERED', ts: Date.now() }, ...pruned]
         })
         setActivity((a) => [
-          { orderId, itemName: current.item_name, from: prevStatus, to: 'DELIVERED', at: now, ts: Date.now(), prevLoc: 'live', nextLoc: 'delivered' },
+          { orderId, itemName: found.item_name, from: prevStatus, to: 'DELIVERED', at: now, ts: Date.now(), prevLoc: 'live', nextLoc: 'delivered' },
           ...a.filter((e) => !(e.orderId === orderId && e.to === 'PREPARING')),
         ])
         return
@@ -84,15 +114,16 @@ function DashboardShell() {
 
       // default: update status in-place
       setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, status: nextStatus } : o)))
-      setRecent((prev) => [{ orderId, itemName: current.item_name, from: prevStatus, to: nextStatus, ts: Date.now() }, ...prev])
+      setRecent((prev) => [{ orderId, itemName: found.item_name, from: prevStatus, to: nextStatus, ts: Date.now() }, ...prev])
       setActivity((a) => [
-        { orderId, itemName: current.item_name, from: prevStatus, to: nextStatus, at: now, ts: Date.now(), prevLoc: 'live', nextLoc: 'live' },
+        { orderId, itemName: found.item_name, from: prevStatus, to: nextStatus, at: now, ts: Date.now(), prevLoc: 'live', nextLoc: 'live' },
         ...a,
       ])
 
     } catch (err) {
       console.error('Failed to update order status:', err)
-      // Fallback: optimistic local update (optional). Keep it conservative: alert the user.
+      // Rollback optimistic update
+      try { setOrders(prevOrdersSnapshot) } catch (e) { /* ignore */ }
       alert('Failed to update order status: ' + (err.message || err))
     }
   }
