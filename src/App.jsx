@@ -342,7 +342,7 @@ function HomePage({ orders, recent = [], onUpdateStatus }) {
             <tbody>
               {latestOrders.map((o) => (
                 <tr key={o.id}>
-                  <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>#{o.id}</span></td>
+                  <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>#{o.order_token || o.id}</span></td>
                   <td><strong>{o.item_name || 'Order Item'}</strong></td>
                   <td>₹{o.total}</td>
                   <td>
@@ -575,7 +575,7 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {} 
         <tbody>
           {orders.map((o) => (
             <tr key={o.id}>
-              <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>#{o.id}</span></td>
+              <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>#{o.order_token || o.id}</span></td>
               <td><strong>{o.item_name || 'Order Item'}</strong></td>
               <td>₹{o.total}</td>
               <td>
@@ -685,7 +685,7 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
                         }}
                       />
                     </div>
-                    <div style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666', fontSize: '0.9em', marginBottom: 4 }}>#{o.id}</div>
+                    <div style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666', fontSize: '0.9em', marginBottom: 4 }}>#{o.order_token || o.id}</div>
                     <div style={{ fontWeight: 600, fontSize: '1.1em' }}>{o.item_name || 'Order Item'}</div>
                     <div style={{ marginBottom: 8 }}>
                       {o.order_placer === 'admin' ? (
@@ -752,7 +752,7 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
             <tbody>
               {deliveredOrders.map((o) => (
                 <tr key={o.id}>
-                  <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>#{o.id}</span></td>
+                  <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>#{o.order_token || o.id}</span></td>
                   <td><strong>{o.item_name || 'Order Item'}</strong></td>
                   <td>₹{o.total}</td>
                   <td><span className="badge ready">READY</span></td>
