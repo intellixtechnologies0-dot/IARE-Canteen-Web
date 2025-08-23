@@ -1,5 +1,5 @@
 import './App.css'
-import { NavLink, Route, Routes, useLocation } from 'react-router-dom'
+import { NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import React, { useEffect, useState } from 'react'
 import supabase from './lib/supabaseClient'
 
@@ -63,12 +63,15 @@ function DashboardShell() {
   const [orders, setOrders] = useState([])
   const [delivered, setDelivered] = useState([])
   const [activity, setActivity] = useState([]) // {orderId, items, from, to, at, prevLoc, nextLoc}
+  const [updatingIds, setUpdatingIds] = useState({}) // { [orderId]: true }
 
   const updateOrderStatus = async (orderId, nextStatus) => {
     // Snapshot current orders to avoid stale closures and allow rollback
     const prevOrdersSnapshot = [...orders]
     // Optimistic UI update to give immediate feedback
     setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, status: nextStatus } : o)))
+    // Mark as updating to prevent action flicker
+    setUpdatingIds((prev) => ({ ...prev, [orderId]: true }))
 
     try {
       // Persist status via RPC
@@ -99,7 +102,8 @@ function DashboardShell() {
       }
 
       if (nextStatus === 'DELIVERED') {
-        setOrders((prev) => prev.filter((o) => o.id !== orderId))
+        // Keep the order visible in the live list but mark it as DELIVERED
+        setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, status: 'DELIVERED' } : o)))
         setDelivered((d) => [{ ...found, status: 'DELIVERED', deliveredAt: Date.now() }, ...d])
         setRecent((prev) => {
           const pruned = prev.filter((e) => !(e.orderId === orderId && e.to === 'PREPARING'))
@@ -125,6 +129,13 @@ function DashboardShell() {
       // Rollback optimistic update
       try { setOrders(prevOrdersSnapshot) } catch (e) { /* ignore */ }
       alert('Failed to update order status: ' + (err.message || err))
+    } finally {
+      // Clear updating flag
+      setUpdatingIds((prev) => {
+        const next = { ...prev }
+        delete next[orderId]
+        return next
+      })
     }
   }
 
@@ -144,12 +155,45 @@ function DashboardShell() {
         }
 
         setConnectionStatus('connecting')
-        const { data, error } = await supabase
-          .from('orders')
-          .select('*')
-          .order('created_at', { ascending: false })
-        if (error) throw error
-        setOrders(data || [])
+        // Fetch in pages to avoid PostgREST default row limits
+        const pageSize = 1000
+        let from = 0
+        let all = []
+        while (true) {
+          const to = from + pageSize - 1
+          const { data, error } = await supabase
+            .from('orders')
+            .select('*')
+            .order('created_at', { ascending: false })
+            .range(from, to)
+          if (error) throw error
+          const batch = data || []
+          all = all.concat(batch)
+          if (batch.length < pageSize) break
+          from += pageSize
+        }
+        // Merge tokens from order_token table if available
+        try {
+          const orderIds = all.map(o => o.id).filter(Boolean)
+          if (orderIds.length > 0) {
+            const { data: tokenRows, error: tokenErr } = await supabase
+              .from('order_token')
+              .select('*')
+              .in('order_id', orderIds)
+            if (tokenErr) throw tokenErr
+            const tokenMap = Object.create(null)
+            for (const r of tokenRows || []) {
+              const key = r.order_id || r.orderId || r.order || r.id
+              const val = r.order_token || r.token || r.token_no || r.token_number || r.id
+              if (key && val) tokenMap[key] = val
+            }
+            all = all.map(o => ({ ...o, token_no: tokenMap[o.id], order_token: tokenMap[o.id] }))
+          }
+        } catch (e) {
+          // If order_token table or columns don't exist, continue gracefully
+          console.warn('Token merge skipped:', e?.message || e)
+        }
+        setOrders(all)
         setConnectionStatus('connected')
         console.log('Successfully fetched orders:', data?.length || 0, 'orders')
       } catch (err) {
@@ -171,7 +215,7 @@ function DashboardShell() {
     let gotRealtime = false
 
     const channel = supabase.channel('public:orders')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'orders' }, (payload) => {
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'orders' }, async (payload) => {
         // when realtime arrives, stop polling and apply change
         if (!gotRealtime) {
           gotRealtime = true
@@ -180,9 +224,21 @@ function DashboardShell() {
             intervalId = null
           }
         }
-        setOrders((prev) => [payload.new, ...prev])
+        let enriched = payload.new
+        try {
+          const { data: tokenRow } = await supabase
+            .from('order_token')
+            .select('*')
+            .eq('order_id', enriched.id)
+            .maybeSingle()
+          if (tokenRow) {
+            const val = tokenRow.order_token || tokenRow.token || tokenRow.token_no || tokenRow.token_number || tokenRow.id
+            if (val) enriched = { ...enriched, token_no: val, order_token: val }
+          }
+        } catch (e) {}
+        setOrders((prev) => [enriched, ...prev])
       })
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'orders' }, (payload) => {
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'orders' }, async (payload) => {
         if (!gotRealtime) {
           gotRealtime = true
           if (intervalId) {
@@ -190,7 +246,24 @@ function DashboardShell() {
             intervalId = null
           }
         }
-        setOrders((prev) => prev.map(o => o.id === payload.new.id ? payload.new : o))
+        let enriched = payload.new
+        try {
+          // Preserve existing token if known
+          setOrders((prev) => {
+            const found = prev.find(o => o.id === payload.new.id)
+            const tokenExisting = found && (found.order_token || found.token_no)
+            let next = { ...payload.new }
+            if (tokenExisting) {
+              next.token_no = tokenExisting
+              next.order_token = tokenExisting
+            }
+            return prev.map(o => o.id === payload.new.id ? next : o)
+          })
+          return
+        } catch (e) {
+          // Fallback: simple replace
+          setOrders((prev) => prev.map(o => o.id === payload.new.id ? enriched : o))
+        }
       })
       .subscribe()
 
@@ -269,9 +342,9 @@ function DashboardShell() {
           )}
         </header>
         <Routes>
-          <Route path="/" element={<HomePage recent={recent} orders={orders} onUpdateStatus={updateOrderStatus} />} />
+          <Route path="/" element={<HomePage recent={recent} orders={orders} onUpdateStatus={updateOrderStatus} updatingIds={updatingIds} />} />
           <Route path="/place-order" element={<PlaceOrderPage />} />
-          <Route path="/orders" element={<OrdersPage orders={orders} deliveredOrders={delivered} activity={activity} onUpdateStatus={updateOrderStatus} onRevert={revertActivity} view={ordersView} pictureMode={ordersPictureMode} />} />
+          <Route path="/orders" element={<OrdersPage orders={orders} deliveredOrders={delivered} activity={activity} onUpdateStatus={updateOrderStatus} onRevert={revertActivity} view={ordersView} pictureMode={ordersPictureMode} updatingIds={updatingIds} />} />
           <Route path="/inventory" element={<InventoryPage />} />
           <Route path="/reports" element={<ReportsPage />} />
           <Route path="/ai" element={<AIPredictionsPage />} />
@@ -292,7 +365,8 @@ function Card({ title, children }) {
   )
 }
 
-function HomePage({ orders, recent = [], onUpdateStatus }) {
+function HomePage({ orders, recent = [], onUpdateStatus, updatingIds = {} }) {
+  const navigate = useNavigate()
   const latestOrders = [...orders]
     .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
     .slice(0, 2)
@@ -322,8 +396,7 @@ function HomePage({ orders, recent = [], onUpdateStatus }) {
         </Card>
         <Card title="Quick Actions">
           <div className="actions">
-            <button className="btn">Refresh Orders</button>
-            <button className="btn">View All Orders</button>
+            <button className="btn" onClick={() => navigate('/orders')}>View All Orders</button>
           </div>
         </Card>
       </div>
@@ -342,7 +415,7 @@ function HomePage({ orders, recent = [], onUpdateStatus }) {
             <tbody>
               {latestOrders.map((o) => (
                 <tr key={o.id}>
-                  <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>#{o.order_token || o.id}</span></td>
+                  <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>#{o.id}</span></td>
                   <td><strong>{o.item_name || 'Order Item'}</strong></td>
                   <td>₹{o.total}</td>
                   <td>
@@ -379,13 +452,14 @@ function HomePage({ orders, recent = [], onUpdateStatus }) {
         </Card>
       </div>
 
-      <OrdersTable orders={latestOrders} onUpdateStatus={onUpdateStatus} />
+      <OrdersTable orders={latestOrders} onUpdateStatus={onUpdateStatus} updatingIds={updatingIds} />
     </div>
   )
 }
 
 function PlaceOrderPage() {
   const [placingOrderId, setPlacingOrderId] = useState(null)
+  const [lastToken, setLastToken] = useState(null)
 
   const menuItems = [
     {
@@ -432,7 +506,20 @@ function PlaceOrderPage() {
 
       if (error) throw error
 
-      alert(`Order placed successfully! Order ID: #${data}`)
+      // Fetch token from order_token table if available
+      let tokenVal = data
+      try {
+        const { data: tokenRow } = await supabase
+          .from('order_token')
+          .select('*')
+          .eq('order_id', data)
+          .maybeSingle()
+        if (tokenRow) {
+          tokenVal = tokenRow.token || tokenRow.token_no || tokenRow.token_number || tokenRow.order_token || tokenRow.id || data
+        }
+      } catch (e) { /* ignore and fallback to data */ }
+      setLastToken(tokenVal)
+      alert(`Order placed successfully! Token No: #${tokenVal}`)
       
       // The order will automatically appear in the Orders panel through Supabase realtime
       // No need to manually update local state
@@ -554,17 +641,25 @@ function PlaceOrderPage() {
           Each order will be created with a unique 4-digit ID and automatically appear in the Orders panel through Supabase.
         </div>
       </Card>
+      {lastToken && (
+        <Card title="Your Token">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666', fontSize: '1.1em' }}>#{lastToken}</div>
+            <div className="muted">Please share this token at the counter.</div>
+          </div>
+        </Card>
+      )}
     </div>
   )
 }
 
-function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {} }) {
+function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {}, idHeader = 'Order ID', updatingIds = {} }) {
   return (
     <Card title={withTitle ? 'Orders' : undefined}>
       <table className="table">
         <thead>
           <tr>
-            <th>Order ID</th>
+            <th>{idHeader}</th>
             <th>Item Name</th>
             <th>Total</th>
             <th>Status</th>
@@ -575,7 +670,7 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {} 
         <tbody>
           {orders.map((o) => (
             <tr key={o.id}>
-              <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>#{o.order_token || o.id}</span></td>
+              <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>{(o.token_no || o.order_token) ? ('#' + (o.token_no || o.order_token)) : 'Not available'}</span></td>
               <td><strong>{o.item_name || 'Order Item'}</strong></td>
               <td>₹{o.total}</td>
               <td>
@@ -609,14 +704,20 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {} 
                 )}
               </td>
               <td className="actions">
-                {normStatus(o.status) === 'PENDING' && (
-                  <button className="btn" onClick={() => onUpdateStatus(o.id, 'PREPARING')}>Mark Preparing</button>
-                )}
-                {normStatus(o.status) === 'PREPARING' && (
-                  <button className="btn" onClick={() => onUpdateStatus(o.id, 'READY')}>Mark Ready</button>
-                )}
-                {normStatus(o.status) === 'READY' && (
-                  <button className="btn" onClick={() => onUpdateStatus(o.id, 'DELIVERED')}>Mark Delivered</button>
+                {updatingIds[o.id] ? (
+                  <button className="btn" disabled><span className="spinner" style={{ marginRight: 6 }} />Updating...</button>
+                ) : (
+                  <>
+                    {normStatus(o.status) === 'PENDING' && (
+                      <button className="btn" onClick={() => onUpdateStatus(o.id, 'PREPARING')}>Mark Preparing</button>
+                    )}
+                    {normStatus(o.status) === 'PREPARING' && (
+                      <button className="btn" onClick={() => onUpdateStatus(o.id, 'READY')}>Mark Ready</button>
+                    )}
+                    {normStatus(o.status) === 'READY' && (
+                      <button className="btn" onClick={() => onUpdateStatus(o.id, 'DELIVERED')}>Mark Delivered</button>
+                    )}
+                  </>
                 )}
               </td>
             </tr>
@@ -627,7 +728,7 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {} 
   )
 }
 
-function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatus, onRevert, view = 'live', pictureMode = false }) {
+function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatus, onRevert, view = 'live', pictureMode = false, updatingIds = {} }) {
   const isLive = view === 'live'
   return (
     <div style={{ display: 'grid', gap: 16 }}>
@@ -685,7 +786,7 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
                         }}
                       />
                     </div>
-                    <div style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666', fontSize: '0.9em', marginBottom: 4 }}>#{o.order_token || o.id}</div>
+                    <div style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666', fontSize: '0.9em', marginBottom: 4 }}>{(o.token_no || o.order_token) ? ('#' + (o.token_no || o.order_token)) : 'Not available'}</div>
                     <div style={{ fontWeight: 600, fontSize: '1.1em' }}>{o.item_name || 'Order Item'}</div>
                     <div style={{ marginBottom: 8 }}>
                       {o.order_placer === 'admin' ? (
@@ -719,13 +820,22 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
                     {normStatus(o.status) === 'DELIVERED' && <span className="badge ready">DELIVERED</span>}
                     </div>
                     <div className="actions" style={{ justifyContent: 'center' }}>
-                      {normStatus(o.status) === 'PENDING' && (
-                        <button className="btn" onClick={() => onUpdateStatus(o.id, 'PREPARING')}>Mark Preparing</button>
-                      )}
-                      {normStatus(o.status) === 'PREPARING' && (
+                      {updatingIds && updatingIds[o.id] ? (
+                        <button className="btn" disabled><span className="spinner" style={{ marginRight: 6 }} />Updating...</button>
+                      ) : (
                         <>
-                          <button className="btn" onClick={() => onUpdateStatus(o.id, 'READY')}>Mark Ready</button>
-                          <button className="btn" onClick={() => onUpdateStatus(o.id, 'DELIVERED')}>Mark Delivered</button>
+                          {normStatus(o.status) === 'PENDING' && (
+                            <button className="btn" onClick={() => onUpdateStatus(o.id, 'PREPARING')}>Mark Preparing</button>
+                          )}
+                          {normStatus(o.status) === 'PREPARING' && (
+                            <>
+                              <button className="btn" onClick={() => onUpdateStatus(o.id, 'READY')}>Mark Ready</button>
+                              <button className="btn" onClick={() => onUpdateStatus(o.id, 'DELIVERED')}>Mark Delivered</button>
+                            </>
+                          )}
+                          {normStatus(o.status) === 'READY' && (
+                            <button className="btn" onClick={() => onUpdateStatus(o.id, 'DELIVERED')}>Mark Delivered</button>
+                          )}
                         </>
                       )}
                     </div>
@@ -735,14 +845,14 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
             </div>
           </Card>
         ) : (
-          <OrdersTable withTitle={false} orders={orders} onUpdateStatus={onUpdateStatus} />
+          <OrdersTable withTitle={false} idHeader="Token No" orders={orders} onUpdateStatus={onUpdateStatus} updatingIds={updatingIds} />
         )
       ) : (
         <Card title={undefined}>
           <table className="table">
             <thead>
               <tr>
-                <th>Order ID</th>
+                <th>Token No</th>
                 <th>Item Name</th>
                 <th>Total</th>
                 <th>Status</th>
@@ -752,11 +862,11 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
             <tbody>
               {deliveredOrders.map((o) => (
                 <tr key={o.id}>
-                  <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>#{o.order_token || o.id}</span></td>
+                  <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>{(o.token_no || o.order_token) ? ('#' + (o.token_no || o.order_token)) : 'Not available'}</span></td>
                   <td><strong>{o.item_name || 'Order Item'}</strong></td>
                   <td>₹{o.total}</td>
-                  <td><span className="badge ready">READY</span></td>
-                  <td>{o.deliveredAt}</td>
+                  <td><span className="badge ready">DELIVERED</span></td>
+                  <td>{o.deliveredAt ? new Date(o.deliveredAt).toLocaleString() : '-'}</td>
                 </tr>
               ))}
             </tbody>
@@ -1275,14 +1385,25 @@ function DebugPanel() {
     setResult(null)
     setError(null)
     try {
-      const { data, error } = await supabase.from('orders').select('*')
-      if (error) {
-        setError(error)
-      } else {
-        setResult(data)
-        // also expose globally for quick inspection
-        window.__IARE_ORDERS__ = data || []
+      const pageSize = 1000
+      let from = 0
+      let all = []
+      while (true) {
+        const to = from + pageSize - 1
+        const { data, error } = await supabase
+          .from('orders')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .range(from, to)
+        if (error) throw error
+        const batch = data || []
+        all = all.concat(batch)
+        if (batch.length < pageSize) break
+        from += pageSize
       }
+      setResult(all)
+      // also expose globally for quick inspection
+      window.__IARE_ORDERS__ = all
     } catch (e) {
       setError(e)
     } finally {

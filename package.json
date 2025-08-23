@@ -5,35 +5,31 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
-    "postbuild": "cpx dist/index.html dist/404.html",
+    "build": "vite build",
+    "postbuild": "cpy dist/index.html dist --rename=404.html",
     "lint": "eslint .",
     "preview": "vite preview",
-    "predeploy": "npm run build",
-    "deploy": "gh-pages -d dist",
-    "deploy:gh": "cross-env VITE_BASE=/IARE-Canteen-Web/ npm run build && gh-pages -d dist"
+    "predeploy": "cross-env VITE_BASE=/IARE-Canteen-Web/ npm run build && npm run postbuild",
+    "deploy": "npm run predeploy && gh-pages -d dist",
+    "deploy:gh": "npm run deploy"
   },
   "dependencies": {
-    "@supabase/auth-ui-react": "^0.4.7",
-    "@supabase/auth-ui-shared": "^0.1.8",
     "@supabase/supabase-js": "^2.55.0",
     "react": "^19.1.1",
-    "react-dom": "^19.1.1"
+    "react-dom": "^19.1.1",
+    "react-router-dom": "^7.8.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.33.0",
-    "@types/react": "^19.1.10",
-    "@types/react-dom": "^19.1.7",
     "@vitejs/plugin-react": "^5.0.0",
     "cpx": "^1.5.0",
+    "cpy-cli": "^6.0.0",
     "cross-env": "^10.0.0",
     "eslint": "^9.33.0",
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.20",
     "gh-pages": "^6.3.0",
     "globals": "^16.3.0",
-    "typescript": "~5.8.3",
-    "typescript-eslint": "^8.39.1",
     "vite": "^7.1.2"
   }
 }
