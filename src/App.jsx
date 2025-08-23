@@ -43,12 +43,14 @@ class ErrorBoundary extends React.Component {
 
 function DashboardShell() {
   const location = useLocation()
+  const navigate = useNavigate()
   const [connectionStatus, setConnectionStatus] = useState('checking')
   const titles = {
     '/': 'Dashboard',
     '/place-order': 'Place Order',
     '/orders': 'Orders',
     '/inventory': 'Inventory Management',
+    '/manage-quantity': 'Manage Quantity',
     '/reports': 'Reports',
     '/ai': 'AI Predictions',
     '/settings': 'Settings',
@@ -351,6 +353,7 @@ function DashboardShell() {
           <NavLink to="/place-order">Place Order</NavLink>
           <NavLink to="/orders">Orders</NavLink>
           <NavLink to="/inventory">Inventory Management</NavLink>
+          <NavLink to="/manage-quantity">Manage Quantity</NavLink>
           <NavLink to="/reports">Reports</NavLink>
           <NavLink to="/ai">AI Predictions</NavLink>
           <NavLink to="/settings">Settings</NavLink>
@@ -361,6 +364,22 @@ function DashboardShell() {
         <header className="topbar">
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <h1 style={{ margin: 0 }}>{title}</h1>
+            {location.pathname === '/inventory' && (
+              <button
+                className="btn"
+                onClick={() => navigate('/manage-quantity')}
+                style={{
+                  padding: '6px 12px',
+                  borderRadius: '999px',
+                  border: '1px solid var(--border)',
+                  background: 'var(--muted-bg)',
+                  fontSize: 12,
+                  lineHeight: 1.2
+                }}
+              >
+                Manage Quantity
+              </button>
+            )}
             {/* connection status indicator removed per request */}
           </div>
           {location.pathname === '/orders' && (
@@ -384,6 +403,7 @@ function DashboardShell() {
           <Route path="/place-order" element={<PlaceOrderPage />} />
           <Route path="/orders" element={<OrdersPage orders={orders} deliveredOrders={delivered} activity={activity} onUpdateStatus={updateOrderStatus} onRevert={revertActivity} view={ordersView} pictureMode={ordersPictureMode} updatingIds={updatingIds} />} />
           <Route path="/inventory" element={<InventoryPage />} />
+          <Route path="/manage-quantity" element={<ManageQuantityPage />} />
           <Route path="/reports" element={<ReportsPage />} />
           <Route path="/ai" element={<AIPredictionsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
@@ -412,6 +432,42 @@ function HomePage({ orders, recent = [], onUpdateStatus, updatingIds = {} }) {
   const totalCount = orders.length + deliveredGlobal.length
   const pendingCount = orders.filter((o) => normStatus(o.status) !== 'READY').length
   const completedCount = deliveredGlobal.length
+  const [shortage, setShortage] = useState([])
+
+  // Fetch out-of-stock items from Supabase food_items for Shortage table
+  useEffect(() => {
+    const fetchShortage = async () => {
+      try {
+        const pageSize = 1000
+        let from = 0
+        let all = []
+        while (true) {
+          const to = from + pageSize - 1
+          const { data, error } = await supabase
+            .from('food_items')
+            .select('*')
+            .range(from, to)
+          if (error) throw error
+          const batch = data || []
+          all = all.concat(batch)
+          if (batch.length < pageSize) break
+          from += pageSize
+        }
+        const mapped = all.map((r) => {
+          const name = r.name ?? r.item_name ?? r.title ?? r.label ?? 'Item'
+          const inStock = (
+            r.in_stock ?? r.available ?? r.is_available ?? (typeof r.stock === 'number' ? r.stock > 0 : undefined) ??
+            (typeof r.status === 'string' ? String(r.status).toLowerCase() === 'in' : undefined) ?? true
+          )
+          return { name, inStock: !!inStock }
+        })
+        setShortage(mapped.filter(i => !i.inStock))
+      } catch (e) {
+        setShortage([])
+      }
+    }
+    fetchShortage()
+  }, [])
 
   return (
     <div style={{ display: 'grid', gap: 16 }}>
@@ -440,34 +496,26 @@ function HomePage({ orders, recent = [], onUpdateStatus, updatingIds = {} }) {
       </div>
 
       <div className="grid-2">
-        <Card title="Orders (Preview - latest 2)">
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Order ID</th>
-                <th>Item Name</th>
-                <th>Total</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {latestOrders.map((o) => (
-                <tr key={o.id}>
-                  <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>#{o.id}</span></td>
-                  <td><strong>{o.item_name}</strong></td>
-                  <td>₹{o.total}</td>
-                  <td>
-                    {normStatus(o.status) === 'PENDING' && <span className="badge pending">PENDING</span>}
-                    {normStatus(o.status) === 'PREPARING' && <span className="badge preparing">PREPARING</span>}
-                    {normStatus(o.status) === 'READY' && <span className="badge ready">READY</span>}
-                    {normStatus(o.status) === 'DELIVERED' && <span className="badge ready">DELIVERED</span>}
-                  </td>
+        <Card title="Shortage">
+          {shortage.length === 0 ? (
+            <div className="muted">No shortages.</div>
+          ) : (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Item</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {shortage.slice(0, 5).map((it, idx) => (
+                  <tr key={idx}>
+                    <td><strong>{it.name}</strong></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </Card>
-
         <Card title="Recent Updates (<=25s)">
           <table className="table">
             <thead>
@@ -499,8 +547,8 @@ function PlaceOrderPage() {
   const [placingOrderId, setPlacingOrderId] = useState(null)
   const [lastToken, setLastToken] = useState(null)
   const [menuItems, setMenuItems] = useState([])
-  const [staffTokens, setStaffTokens] = useState([])
-  const [loadingStaff, setLoadingStaff] = useState(false)
+  const [counterTokens, setCounterTokens] = useState([])
+  const [loadingCounter, setLoadingCounter] = useState(false)
   const [search, setSearch] = useState('')
 
   // Load items from Supabase `food_items` table (replaces testing items)
@@ -538,9 +586,9 @@ function PlaceOrderPage() {
     fetchFoodItems()
   }, [])
 
-  // Fetch token numbers for items placed by staff (order_placer = 'admin')
-  const fetchStaffTokens = async () => {
-    setLoadingStaff(true)
+  // Fetch token numbers for items placed by Counter (order_placer = 'admin')
+  const fetchCounterTokens = async () => {
+    setLoadingCounter(true)
     try {
       const pageSize = 1000
       let from = 0
@@ -579,16 +627,16 @@ function PlaceOrderPage() {
       } catch (e) {
         // ignore token merge errors
       }
-      setStaffTokens(all)
+      setCounterTokens(all)
     } catch (e) {
-      console.error('Failed to fetch staff tokens:', e)
+      console.error('Failed to fetch Counter tokens:', e)
     } finally {
-      setLoadingStaff(false)
+      setLoadingCounter(false)
     }
   }
 
   useEffect(() => {
-    fetchStaffTokens()
+    fetchCounterTokens()
   }, [])
 
   const handlePlaceOrder = async (item) => {
@@ -765,11 +813,11 @@ function PlaceOrderPage() {
           Each order will be created with a unique 4-digit ID and automatically appear in the Orders panel through Supabase.
         </div>
       </Card>
-      <Card title="Staff Tokens (Placed by Staff)">
-        {loadingStaff ? (
+      <Card title="Counter Tokens (Placed by Counter)">
+        {loadingCounter ? (
           <div className="muted">Loading...</div>
-        ) : staffTokens.length === 0 ? (
-          <div className="muted">No staff orders yet.</div>
+        ) : counterTokens.length === 0 ? (
+          <div className="muted">No Counter orders yet.</div>
         ) : (
           <table className="table">
             <thead>
@@ -781,7 +829,7 @@ function PlaceOrderPage() {
               </tr>
             </thead>
             <tbody>
-              {staffTokens.slice(0, 10).map((o) => (
+              {counterTokens.slice(0, 10).map((o) => (
                 <tr key={o.id}>
                   <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>{(o.token_no || o.order_token) ? ('#' + (o.token_no || o.order_token)) : 'Not available'}</span></td>
                   <td>{o.item_name}</td>
@@ -845,7 +893,7 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {},
                     fontSize: '12px',
                     fontWeight: '500'
                   }}>
-                    👨‍💼 Staff
+                    🧑‍💻 Counter
                   </span>
                 ) : (
                   <span style={{ 
@@ -856,7 +904,7 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {},
                     fontSize: '12px',
                     fontWeight: '500'
                   }}>
-                    👨‍🎓 Student
+                    🧑‍🎓 Student
                   </span>
                 )}
               </td>
@@ -964,7 +1012,7 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
                           fontSize: '10px',
                           fontWeight: '500'
                         }}>
-                          👨‍💼 Staff
+                          🧑‍💻 Counter
                         </span>
                       ) : (
                         <span style={{ 
@@ -975,7 +1023,7 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
                           fontSize: '10px',
                           fontWeight: '500'
                         }}>
-                          👨‍🎓 Student
+                          🧑‍🎓 Student
                         </span>
                       )}
                     </div>
@@ -1045,6 +1093,7 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
 
 function InventoryPage() {
   // Only the features requested: add, remove, mark out of stock / in stock
+  const navigate = useNavigate()
   const [items, setItems] = useState([])
   const [form, setForm] = useState({ id: '', name: '' })
   const [search, setSearch] = useState('')
@@ -1194,6 +1243,8 @@ function InventoryPage() {
           <div className="stat-label">Unavailable</div>
         </Card>
       </div>
+
+      
 
       <Card title="Add Item">
         <div className="form">
@@ -1486,6 +1537,97 @@ function ReportsPage() {
                 <td>₹{r.total}</td>
                 <td>{new Date(r.receivedTs).toLocaleString()}</td>
                 <td>{new Date(r.deliveredTs).toLocaleString()}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  )
+}
+
+function ManageQuantityPage() {
+  const [rows, setRows] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+
+  const load = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const pageSize = 1000
+      let from = 0
+      let all = []
+      while (true) {
+        const to = from + pageSize - 1
+        const { data, error } = await supabase
+          .from('food_items')
+          .select('*')
+          .order('name', { ascending: true })
+          .range(from, to)
+        if (error) throw error
+        const batch = data || []
+        all = all.concat(batch)
+        if (batch.length < pageSize) break
+        from += pageSize
+      }
+      const mapped = all.map(r => ({
+        id: r.id ?? r.item_id ?? r.slug ?? String(Math.random()).slice(2),
+        name: r.name ?? r.item_name ?? 'Item',
+        qty: (typeof r.quantity === 'number' ? r.quantity : (typeof r.stock === 'number' ? r.stock : 0))
+      }))
+      setRows(mapped)
+    } catch (e) {
+      setError(e)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { load() }, [])
+
+  const updateQty = async (id, nextQty) => {
+    const prev = rows
+    setRows(r => r.map(x => x.id === id ? { ...x, qty: nextQty } : x))
+    try {
+      const { error } = await supabase
+        .from('food_items')
+        .update({ quantity: Number(nextQty) })
+        .eq('id', id)
+      if (error) throw error
+    } catch (e) {
+      setRows(prev)
+      alert('Failed to update quantity')
+    }
+  }
+
+  return (
+    <div style={{ display: 'grid', gap: 16 }}>
+      <Card title="Food Items Quantity">
+        <div className="actions" style={{ marginBottom: 8 }}>
+          <button className="btn" onClick={load} disabled={loading}>{loading ? 'Refreshing...' : 'Refresh'}</button>
+        </div>
+        {error && <div className="muted" style={{ color: 'crimson' }}>{String(error.message || error)}</div>}
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Item</th>
+              <th>Quantity</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => (
+              <tr key={r.id}>
+                <td><strong>{r.name}</strong></td>
+                <td>
+                  <input
+                    type="number"
+                    className="input"
+                    style={{ width: 120 }}
+                    value={r.qty}
+                    onChange={(e) => updateQty(r.id, Number(e.target.value))}
+                  />
+                </td>
               </tr>
             ))}
           </tbody>
