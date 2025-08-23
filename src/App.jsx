@@ -102,8 +102,8 @@ function DashboardShell() {
       }
 
       if (nextStatus === 'DELIVERED') {
-        // Keep the order visible in the live list but mark it as DELIVERED
-        setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, status: 'DELIVERED' } : o)))
+        // Move the order out of the live list into the past list
+        setOrders((prev) => prev.filter((o) => o.id !== orderId))
         setDelivered((d) => [{ ...found, status: 'DELIVERED', deliveredAt: Date.now() }, ...d])
         setRecent((prev) => {
           const pruned = prev.filter((e) => !(e.orderId === orderId && e.to === 'PREPARING'))
@@ -161,12 +161,12 @@ function DashboardShell() {
         let all = []
         while (true) {
           const to = from + pageSize - 1
-          const { data, error } = await supabase
-            .from('orders')
-            .select('*')
-            .order('created_at', { ascending: false })
+        const { data, error } = await supabase
+          .from('orders')
+          .select('*')
+          .order('created_at', { ascending: false })
             .range(from, to)
-          if (error) throw error
+        if (error) throw error
           const batch = data || []
           all = all.concat(batch)
           if (batch.length < pageSize) break
@@ -193,7 +193,11 @@ function DashboardShell() {
           // If order_token table or columns don't exist, continue gracefully
           console.warn('Token merge skipped:', e?.message || e)
         }
-        setOrders(all)
+        // Split into live and past
+        const live = (all || []).filter((o) => normStatus(o.status) !== 'DELIVERED')
+        const past = (all || []).filter((o) => normStatus(o.status) === 'DELIVERED')
+        setOrders(live)
+        setDelivered(past)
         setConnectionStatus('connected')
         console.log('Successfully fetched orders:', data?.length || 0, 'orders')
       } catch (err) {
@@ -257,12 +261,25 @@ function DashboardShell() {
               next.token_no = tokenExisting
               next.order_token = tokenExisting
             }
-            return prev.map(o => o.id === payload.new.id ? next : o)
+            // If delivered, remove from live; otherwise, update in place
+            if (normStatus(next.status) === 'DELIVERED') {
+              return prev.filter(o => o.id !== next.id)
+            }
+            return prev.map(o => (o.id === next.id ? next : o))
           })
+          // If delivered, add to past list
+          if (normStatus(payload.new.status) === 'DELIVERED') {
+            setDelivered((d) => [{ ...enriched, deliveredAt: Date.now() }, ...d.filter((o) => o.id !== enriched.id)])
+          }
           return
         } catch (e) {
           // Fallback: simple replace
-          setOrders((prev) => prev.map(o => o.id === payload.new.id ? enriched : o))
+          if (normStatus(enriched.status) === 'DELIVERED') {
+            setOrders((prev) => prev.filter(o => o.id !== enriched.id))
+            setDelivered((d) => [{ ...enriched, deliveredAt: Date.now() }, ...d.filter((o) => o.id !== enriched.id)])
+          } else {
+            setOrders((prev) => prev.map(o => (o.id === enriched.id ? enriched : o)))
+          }
         }
       })
       .subscribe()
@@ -273,7 +290,7 @@ function DashboardShell() {
     }
   }, [])
 
-  const revertActivity = (entry) => {
+  const revertActivity = async (entry) => {
     if (!entry) return
     const { orderId, from, to, prevLoc, nextLoc } = entry
     if (prevLoc === 'live' && nextLoc === 'delivered') {
@@ -282,9 +299,30 @@ function DashboardShell() {
       if (!found) return
       setDelivered((d) => d.filter((o) => o.id !== orderId))
       setOrders((prev) => [{ ...found, status: from }, ...prev])
+      // record revert in recent updates for Home panel
+      setRecent((prev) => [{ orderId, itemName: found.item_name, from: to, to: from, ts: Date.now() }, ...prev])
+      // persist to backend so realtime reflects across clients
+      try {
+        await supabase.rpc('update_order_status', {
+          p_order_id: orderId,
+          p_new_status: String(from).toLowerCase(),
+        })
+      } catch (e) { /* ignore; local state already reflects revert */ }
     } else if (prevLoc === 'live' && nextLoc === 'live') {
       // just status change revert
       setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, status: from } : o)))
+      // try to find the order name from current state to log the revert
+      try {
+        const current = orders.find((o) => o.id === orderId)
+        const itemName = current?.item_name || 'Order Item'
+        setRecent((prev) => [{ orderId, itemName, from: to, to: from, ts: Date.now() }, ...prev])
+      } catch (_) { /* ignore */ }
+      try {
+        await supabase.rpc('update_order_status', {
+          p_order_id: orderId,
+          p_new_status: String(from).toLowerCase(),
+        })
+      } catch (e) { /* ignore */ }
     }
     // Remove the reverted entry from activity to avoid confusion
     setActivity((a) => a.filter((e) => e !== entry))
@@ -337,7 +375,7 @@ function DashboardShell() {
               )}
             </div>
           )}
-          {location.pathname !== '/orders' && (
+          {location.pathname !== '/orders' && location.pathname !== '/place-order' && (
             <input className="search" placeholder="Search" />
           )}
         </header>
@@ -416,7 +454,7 @@ function HomePage({ orders, recent = [], onUpdateStatus, updatingIds = {} }) {
               {latestOrders.map((o) => (
                 <tr key={o.id}>
                   <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>#{o.id}</span></td>
-                  <td><strong>{o.item_name || 'Order Item'}</strong></td>
+                  <td><strong>{o.item_name}</strong></td>
                   <td>₹{o.total}</td>
                   <td>
                     {normStatus(o.status) === 'PENDING' && <span className="badge pending">PENDING</span>}
@@ -460,59 +498,137 @@ function HomePage({ orders, recent = [], onUpdateStatus, updatingIds = {} }) {
 function PlaceOrderPage() {
   const [placingOrderId, setPlacingOrderId] = useState(null)
   const [lastToken, setLastToken] = useState(null)
+  const [menuItems, setMenuItems] = useState([])
+  const [staffTokens, setStaffTokens] = useState([])
+  const [loadingStaff, setLoadingStaff] = useState(false)
+  const [search, setSearch] = useState('')
 
-  const menuItems = [
-    {
-      id: 'samosa',
-      name: 'Samosa',
-      price: 40,
-      image: 'https://as2.ftcdn.net/v2/jpg/15/85/73/65/1000_F_1585736532_NFMq8z0vAjbker6w9vuzoF8FmsxVRGPI.jpg',
-      description: 'Crispy potato and pea samosa'
-    },
-    {
-      id: 'veg-biryani',
-      name: 'Veg Biryani',
-      price: 180,
-      image: 'https://as1.ftcdn.net/v2/jpg/04/59/27/88/1000_F_459278894_92eSlejnR7NSwJRCbVyy9ZZibSmjbF8q.jpg',
-      description: 'Aromatic vegetable biryani with spices'
-    },
-    {
-      id: 'chicken-biryani',
-      name: 'Chicken Biryani',
-      price: 200,
-      image: 'https://as1.ftcdn.net/v2/jpg/04/59/27/88/1000_F_459278894_92eSlejnR7NSwJRCbVyy9ZZibSmjbF8q.jpg',
-      description: 'Tender chicken biryani with basmati rice'
-    },
-    {
-      id: 'masala-dosa',
-      name: 'Masala Dosa',
-      price: 80,
-      image: 'https://as2.ftcdn.net/v2/jpg/14/45/94/59/1000_F_1445945944_eBUM7ot1AWezNkqknKsRImNvLvFbmr7z.jpg',
-      description: 'Crispy dosa with potato filling'
+  // Load items from Supabase `food_items` table (replaces testing items)
+  useEffect(() => {
+    const fetchFoodItems = async () => {
+      try {
+        const pageSize = 1000
+        let from = 0
+        let all = []
+        while (true) {
+          const to = from + pageSize - 1
+          const { data, error } = await supabase
+            .from('food_items')
+            .select('*')
+            .range(from, to)
+          if (error) throw error
+          const batch = data || []
+          all = all.concat(batch)
+          if (batch.length < pageSize) break
+          from += pageSize
+        }
+        const mapped = all.map((r) => ({
+          id: r.id ?? r.item_id ?? r.slug ?? String(Math.random()).slice(2),
+          name: r.name ?? r.item_name ?? 'Item',
+          price: r.price ?? r.cost ?? 0,
+          image: r.image_url ?? r.image ?? r.photo ?? 'https://via.placeholder.com/300?text=Food',
+          description: r.description ?? ''
+        }))
+        setMenuItems(mapped)
+      } catch (e) {
+        console.error('Failed to load food_items:', e)
+        setMenuItems([])
+      }
     }
-  ]
+    fetchFoodItems()
+  }, [])
+
+  // Fetch token numbers for items placed by staff (order_placer = 'admin')
+  const fetchStaffTokens = async () => {
+    setLoadingStaff(true)
+    try {
+      const pageSize = 1000
+      let from = 0
+      let all = []
+      while (true) {
+        const to = from + pageSize - 1
+        const { data, error } = await supabase
+          .from('orders')
+          .select('id, item_name, status, order_placer, created_at')
+          .eq('order_placer', 'admin')
+          .order('created_at', { ascending: false })
+          .range(from, to)
+        if (error) throw error
+        const batch = data || []
+        all = all.concat(batch)
+        if (batch.length < pageSize) break
+        from += pageSize
+      }
+      // Merge tokens from order_token table
+      try {
+        const ids = all.map(o => o.id).filter(Boolean)
+        if (ids.length > 0) {
+          const { data: tokenRows, error: tokenErr } = await supabase
+            .from('order_token')
+            .select('*')
+            .in('order_id', ids)
+          if (tokenErr) throw tokenErr
+          const tokenMap = Object.create(null)
+          for (const r of tokenRows || []) {
+            const key = r.order_id || r.orderId || r.order || r.id
+            const val = r.order_token || r.token || r.token_no || r.token_number || r.id
+            if (key && val) tokenMap[key] = val
+          }
+          all = all.map(o => ({ ...o, token_no: tokenMap[o.id], order_token: tokenMap[o.id] }))
+        }
+      } catch (e) {
+        // ignore token merge errors
+      }
+      setStaffTokens(all)
+    } catch (e) {
+      console.error('Failed to fetch staff tokens:', e)
+    } finally {
+      setLoadingStaff(false)
+    }
+  }
+
+  useEffect(() => {
+    fetchStaffTokens()
+  }, [])
 
   const handlePlaceOrder = async (item) => {
     if (placingOrderId) return // Prevent multiple orders while one is processing
     
     setPlacingOrderId(item.id)
     try {
+      // Try primary RPC path
       const { data, error } = await supabase.rpc('create_order', {
         p_item_name: item.name,
         p_total: item.price,
         p_status: 'PENDING',
         p_order_placer: 'admin'
       })
-
-      if (error) throw error
+      let createdId = data
+      if (error) {
+        // Fallback path: generate id then insert into orders
+        console.warn('create_order RPC failed, attempting fallback insert:', error?.message || error)
+        const { data: genId, error: genErr } = await supabase.rpc('generate_order_id')
+        if (genErr) throw genErr
+        createdId = genId
+        const { error: insErr } = await supabase
+          .from('orders')
+          .insert({
+            id: createdId,
+            item_name: item.name,
+            total: item.price,
+            status: 'PENDING',
+            order_placer: 'admin',
+          })
+        if (insErr) throw insErr
+      }
 
       // Fetch token from order_token table if available
-      let tokenVal = data
+      let tokenVal = createdId
       try {
         const { data: tokenRow } = await supabase
           .from('order_token')
           .select('*')
-          .eq('order_id', data)
+          .eq('order_id', createdId)
           .maybeSingle()
         if (tokenRow) {
           tokenVal = tokenRow.token || tokenRow.token_no || tokenRow.token_number || tokenRow.order_token || tokenRow.id || data
@@ -535,13 +651,21 @@ function PlaceOrderPage() {
   return (
     <div style={{ display: 'grid', gap: 16 }}>
       <Card title="Menu - Place Order (Cash Payment)">
+        <div className="form" style={{ marginBottom: 8 }}>
+          <div className="field" style={{ minWidth: 320 }}>
+            <input className="input" style={{ width: '320px' }} placeholder="Search menu items..." value={search} onChange={(e) => setSearch(e.target.value)} />
+          </div>
+        </div>
         <div style={{ 
           display: 'grid', 
           gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', 
           gap: 20,
           padding: '16px 0'
         }}>
-          {menuItems.map((item) => (
+          {(menuItems.filter(it => {
+            const q = search.trim().toLowerCase()
+            return q ? String(it.name || '').toLowerCase().includes(q) : true
+          })).map((item) => (
             <div key={item.id} style={{
               border: '1px solid #e5e7eb',
               borderRadius: '12px',
@@ -641,6 +765,39 @@ function PlaceOrderPage() {
           Each order will be created with a unique 4-digit ID and automatically appear in the Orders panel through Supabase.
         </div>
       </Card>
+      <Card title="Staff Tokens (Placed by Staff)">
+        {loadingStaff ? (
+          <div className="muted">Loading...</div>
+        ) : staffTokens.length === 0 ? (
+          <div className="muted">No staff orders yet.</div>
+        ) : (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Token</th>
+                <th>Item</th>
+                <th>Status</th>
+                <th>Time</th>
+              </tr>
+            </thead>
+            <tbody>
+              {staffTokens.slice(0, 10).map((o) => (
+                <tr key={o.id}>
+                  <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>{(o.token_no || o.order_token) ? ('#' + (o.token_no || o.order_token)) : 'Not available'}</span></td>
+                  <td>{o.item_name}</td>
+                  <td>
+                    {normStatus(o.status) === 'PENDING' && <span className="badge pending">PENDING</span>}
+                    {normStatus(o.status) === 'PREPARING' && <span className="badge preparing">PREPARING</span>}
+                    {normStatus(o.status) === 'READY' && <span className="badge ready">READY</span>}
+                    {normStatus(o.status) === 'DELIVERED' && <span className="badge ready">DELIVERED</span>}
+                  </td>
+                  <td>{o.created_at ? new Date(o.created_at).toLocaleTimeString() : '-'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
       {lastToken && (
         <Card title="Your Token">
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -671,7 +828,7 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {},
           {orders.map((o) => (
             <tr key={o.id}>
               <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>{(o.token_no || o.order_token) ? ('#' + (o.token_no || o.order_token)) : 'Not available'}</span></td>
-              <td><strong>{o.item_name || 'Order Item'}</strong></td>
+              <td><strong>{o.item_name}</strong></td>
               <td>₹{o.total}</td>
               <td>
                 {normStatus(o.status) === 'PENDING' && <span className="badge pending">PENDING</span>}
@@ -708,14 +865,14 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {},
                   <button className="btn" disabled><span className="spinner" style={{ marginRight: 6 }} />Updating...</button>
                 ) : (
                   <>
-                    {normStatus(o.status) === 'PENDING' && (
-                      <button className="btn" onClick={() => onUpdateStatus(o.id, 'PREPARING')}>Mark Preparing</button>
-                    )}
-                    {normStatus(o.status) === 'PREPARING' && (
-                      <button className="btn" onClick={() => onUpdateStatus(o.id, 'READY')}>Mark Ready</button>
-                    )}
-                    {normStatus(o.status) === 'READY' && (
-                      <button className="btn" onClick={() => onUpdateStatus(o.id, 'DELIVERED')}>Mark Delivered</button>
+                {normStatus(o.status) === 'PENDING' && (
+                  <button className="btn" onClick={() => onUpdateStatus(o.id, 'PREPARING')}>Mark Preparing</button>
+                )}
+                {normStatus(o.status) === 'PREPARING' && (
+                  <button className="btn" onClick={() => onUpdateStatus(o.id, 'READY')}>Mark Ready</button>
+                )}
+                {normStatus(o.status) === 'READY' && (
+                  <button className="btn" onClick={() => onUpdateStatus(o.id, 'DELIVERED')}>Mark Delivered</button>
                     )}
                   </>
                 )}
@@ -730,6 +887,13 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {},
 
 function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatus, onRevert, view = 'live', pictureMode = false, updatingIds = {} }) {
   const isLive = view === 'live'
+  const tokenFor = (orderId) => {
+    try {
+      const found = orders.find(o => o.id === orderId) || deliveredOrders.find(o => o.id === orderId)
+      const t = found && (found.token_no || found.order_token)
+      return t ? ('#' + t) : 'Not available'
+    } catch (_) { return 'Not available' }
+  }
   return (
     <div style={{ display: 'grid', gap: 16 }}>
       {view === 'activity' ? (
@@ -738,6 +902,7 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
             <thead>
               <tr>
                 <th>Item Name</th>
+                <th>Token No</th>
                 <th>From → To</th>
                 <th>At</th>
                 <th>Actions</th>
@@ -747,6 +912,7 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
               {activity.slice(0, 20).map((e, idx) => (
                 <tr key={idx}>
                   <td><strong>{e.itemName || 'Order Item'}</strong></td>
+                  <td>{tokenFor(e.orderId)}</td>
                   <td>{e.from} → {e.to}</td>
                   <td>{e.at}</td>
                   <td>
@@ -787,7 +953,7 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
                       />
                     </div>
                     <div style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666', fontSize: '0.9em', marginBottom: 4 }}>{(o.token_no || o.order_token) ? ('#' + (o.token_no || o.order_token)) : 'Not available'}</div>
-                    <div style={{ fontWeight: 600, fontSize: '1.1em' }}>{o.item_name || 'Order Item'}</div>
+                    <div style={{ fontWeight: 600, fontSize: '1.1em' }}>{o.item_name}</div>
                     <div style={{ marginBottom: 8 }}>
                       {o.order_placer === 'admin' ? (
                         <span style={{ 
@@ -824,17 +990,17 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
                         <button className="btn" disabled><span className="spinner" style={{ marginRight: 6 }} />Updating...</button>
                       ) : (
                         <>
-                          {normStatus(o.status) === 'PENDING' && (
-                            <button className="btn" onClick={() => onUpdateStatus(o.id, 'PREPARING')}>Mark Preparing</button>
-                          )}
-                          {normStatus(o.status) === 'PREPARING' && (
-                            <>
-                              <button className="btn" onClick={() => onUpdateStatus(o.id, 'READY')}>Mark Ready</button>
-                              <button className="btn" onClick={() => onUpdateStatus(o.id, 'DELIVERED')}>Mark Delivered</button>
-                            </>
-                          )}
-                          {normStatus(o.status) === 'READY' && (
-                            <button className="btn" onClick={() => onUpdateStatus(o.id, 'DELIVERED')}>Mark Delivered</button>
+                      {normStatus(o.status) === 'PENDING' && (
+                        <button className="btn" onClick={() => onUpdateStatus(o.id, 'PREPARING')}>Mark Preparing</button>
+                      )}
+                      {normStatus(o.status) === 'PREPARING' && (
+                        <>
+                          <button className="btn" onClick={() => onUpdateStatus(o.id, 'READY')}>Mark Ready</button>
+                          <button className="btn" onClick={() => onUpdateStatus(o.id, 'DELIVERED')}>Mark Delivered</button>
+                        </>
+                      )}
+                      {normStatus(o.status) === 'READY' && (
+                        <button className="btn" onClick={() => onUpdateStatus(o.id, 'DELIVERED')}>Mark Delivered</button>
                           )}
                         </>
                       )}
@@ -856,17 +1022,15 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
                 <th>Item Name</th>
                 <th>Total</th>
                 <th>Status</th>
-                <th>Delivered</th>
               </tr>
             </thead>
             <tbody>
               {deliveredOrders.map((o) => (
                 <tr key={o.id}>
                   <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>{(o.token_no || o.order_token) ? ('#' + (o.token_no || o.order_token)) : 'Not available'}</span></td>
-                  <td><strong>{o.item_name || 'Order Item'}</strong></td>
+                  <td><strong>{o.item_name}</strong></td>
                   <td>₹{o.total}</td>
                   <td><span className="badge ready">DELIVERED</span></td>
-                  <td>{o.deliveredAt ? new Date(o.deliveredAt).toLocaleString() : '-'}</td>
                 </tr>
               ))}
             </tbody>
@@ -883,20 +1047,135 @@ function InventoryPage() {
   // Only the features requested: add, remove, mark out of stock / in stock
   const [items, setItems] = useState([])
   const [form, setForm] = useState({ id: '', name: '' })
+  const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('all') // all | in | out
+  const [idField, setIdField] = useState('id')
+  const [availabilityField, setAvailabilityField] = useState('in_stock')
+  const [selectedIds, setSelectedIds] = useState(() => new Set())
+
+  // Fetch all items from Supabase table `food_items`
+  useEffect(() => {
+    const fetchItems = async () => {
+      try {
+        const pageSize = 1000
+        let from = 0
+        let all = []
+        while (true) {
+          const to = from + pageSize - 1
+          const { data, error } = await supabase
+            .from('food_items')
+            .select('*')
+            .range(from, to)
+          if (error) throw error
+          const batch = data || []
+          all = all.concat(batch)
+          if (batch.length < pageSize) break
+          from += pageSize
+        }
+        // Detect backend id and availability field from sample row
+        const sample = all[0] || {}
+        const idCandidates = ['id', 'item_id', 'slug', 'code']
+        const availCandidates = ['in_stock', 'available', 'is_available', 'stock', 'status']
+        const detectedIdField = idCandidates.find(k => Object.prototype.hasOwnProperty.call(sample, k)) || 'id'
+        const detectedAvailField = availCandidates.find(k => Object.prototype.hasOwnProperty.call(sample, k)) || 'in_stock'
+        setIdField(detectedIdField)
+        setAvailabilityField(detectedAvailField)
+        // Map backend rows to local shape { id, name, inStock }
+        const mapped = all.map((r) => {
+          const id = r[detectedIdField] ?? String(Math.random()).slice(2)
+          const name = r.name ?? r.item_name ?? r.title ?? r.label ?? 'Item'
+          const inStock = (
+            r.in_stock ?? r.available ?? r.is_available ?? (typeof r.stock === 'number' ? r.stock > 0 : undefined) ??
+            (typeof r.status === 'string' ? String(r.status).toLowerCase() === 'in' : undefined) ?? true
+          )
+          return { id, name, inStock: !!inStock }
+        })
+        setItems(mapped)
+      } catch (e) {
+        console.error('Failed to fetch food_items from Supabase:', e)
+      }
+    }
+    fetchItems()
+  }, [])
 
   const addItem = () => {
-    if (!form.id || !form.name) return
-    setItems((prev) => [...prev, { id: form.id, name: form.name, inStock: true }])
+    if (!form.name) return
+    const generatedId = 'local-' + Math.random().toString(36).slice(2, 10)
+    setItems((prev) => [...prev, { id: generatedId, name: form.name, inStock: true, _local: true }])
     setForm({ id: '', name: '' })
   }
 
-  const toggleStock = (id, inStock) => {
-    setItems((prev) => prev.map((it) => (it.id === id ? { ...it, inStock } : it)))
+  const toggleStock = async (id, inStock) => {
+    // Optimistic update
+    const prev = items
+    setItems((p) => p.map((it) => (it.id === id ? { ...it, inStock } : it)))
+    try {
+      const target = items.find((it) => it.id === id)
+      if (target && target._local) {
+        // Local-only item: skip backend update
+        return
+      }
+      // Build update payload based on detected availability field
+      let update = {}
+      if (availabilityField === 'stock') {
+        update[availabilityField] = inStock ? 1 : 0
+      } else if (availabilityField === 'status') {
+        update[availabilityField] = inStock ? 'in' : 'out'
+      } else {
+        update[availabilityField] = !!inStock
+      }
+      const { error } = await supabase
+        .from('food_items')
+        .update(update)
+        .eq(idField, id)
+      if (error) throw error
+    } catch (e) {
+      console.error('Failed to update stock in Supabase:', e)
+      // Rollback on error
+      setItems(prev)
+      alert('Failed to update in backend. Please try again.')
+    }
   }
 
   const deleteItem = (id) => {
     setItems((prev) => prev.filter((it) => it.id !== id))
+  }
+
+  // Derived list based on current search and filter
+  const displayedItems = items.filter((i) => {
+    const q = search.trim().toLowerCase()
+    const matchesSearch = q ? String(i.name || '').toLowerCase().includes(q) : true
+    const matchesFilter = filter==='all' || (filter==='in' ? i.inStock : !i.inStock)
+    return matchesSearch && matchesFilter
+  })
+
+  const allSelected = displayedItems.length > 0 && displayedItems.every(it => selectedIds.has(it.id))
+
+  const toggleSelect = (id, checked) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (checked) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }
+
+  const toggleMarkAllDisplayed = () => {
+    if (allSelected) {
+      // Unmark all displayed
+      setSelectedIds(prev => {
+        const next = new Set(prev)
+        displayedItems.forEach(it => next.delete(it.id))
+        return next
+      })
+    } else {
+      // Mark all displayed (merge with existing selections)
+      setSelectedIds(prev => {
+        const next = new Set(prev)
+        displayedItems.forEach(it => next.add(it.id))
+        return next
+      })
+    }
   }
 
   return (
@@ -916,20 +1195,8 @@ function InventoryPage() {
         </Card>
       </div>
 
-      <Card title="Filters">
-        <div className="actions">
-          <button className={`btn ${filter==='all' ? 'active' : ''}`} onClick={() => setFilter('all')}>All</button>
-          <button className={`btn ${filter==='in' ? 'active' : ''}`} onClick={() => setFilter('in')}>In Stock</button>
-          <button className={`btn ${filter==='out' ? 'active' : ''}`} onClick={() => setFilter('out')}>Out of Stock</button>
-        </div>
-      </Card>
-
       <Card title="Add Item">
         <div className="form">
-          <div className="field">
-            <label className="label">Item ID</label>
-            <input className="input" value={form.id} onChange={(e) => setForm({ ...form, id: e.target.value })} />
-          </div>
           <div className="field" style={{ minWidth: 240 }}>
             <label className="label">Name</label>
             <input className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
@@ -938,22 +1205,42 @@ function InventoryPage() {
         </div>
       </Card>
 
+      <Card title="Search Items">
+        <div className="form">
+          <div className="field" style={{ minWidth: 320 }}>
+            <input className="input" style={{ width: '320px' }} placeholder="Search food items..." value={search} onChange={(e) => setSearch(e.target.value)} />
+          </div>
+          <div className="actions" style={{ marginLeft: 'auto' }}>
+            <button className={`btn ${filter==='all' ? 'active' : ''}`} onClick={() => setFilter('all')}>All</button>
+            <button className={`btn ${filter==='in' ? 'active' : ''}`} onClick={() => setFilter('in')}>In Stock</button>
+            <button className={`btn ${filter==='out' ? 'active' : ''}`} onClick={() => setFilter('out')}>Out of Stock</button>
+          </div>
+        </div>
+      </Card>
+
       <Card title="Items">
+        <div className="actions" style={{ marginBottom: 8 }}>
+          <button className="btn" onClick={toggleMarkAllDisplayed}>{allSelected ? 'Unmark All' : 'Mark All'}</button>
+        </div>
         <table className="table">
           <thead>
             <tr>
-              <th>ID</th>
+              <th>Select</th>
               <th>Name</th>
               <th>Status</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody>
-            {items
-              .filter((i) => filter==='all' || (filter==='in' ? i.inStock : !i.inStock))
-              .map((it) => (
+            {displayedItems.map((it) => (
               <tr key={it.id}>
-                <td>{it.id}</td>
+                <td>
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(it.id)}
+                    onChange={(e) => toggleSelect(it.id, e.target.checked)}
+                  />
+                </td>
                 <td>{it.name}</td>
                 <td>
                   {it.inStock ? (
@@ -981,22 +1268,78 @@ function InventoryPage() {
 function ReportsPage() {
   const [from, setFrom] = useState(() => new Date(Date.now()-24*60*60*1000).toISOString().slice(0, 10))
   const [to, setTo] = useState(() => new Date().toISOString().slice(0, 10))
+  const [itemsMap, setItemsMap] = useState({}) // maps food_items id/item_id -> name
   // Build rows dynamically from delivered orders only
   const dataDelivered = (window.__IARE_DELIVERED__ || [])
-  const rows = dataDelivered.map(o => ({
-    id: o.id,
-    item: o.items,
-    qty: 1,
-    total: o.total,
-    status: o.status,
-    receivedTs: o.createdAt || o.receivedAt || o.deliveredAt,
-    deliveredTs: o.deliveredAt,
-  }))
+  const toValidMs = (ts) => {
+    const d = new Date(ts)
+    return isNaN(d) ? null : d.getTime()
+  }
+  // Fetch food_items to resolve item names from backend
+  useEffect(() => {
+    const fetchItems = async () => {
+      try {
+        const pageSize = 1000
+        let fromIdx = 0
+        let all = []
+        while (true) {
+          const toIdx = fromIdx + pageSize - 1
+          const { data, error } = await supabase
+            .from('food_items')
+            .select('*')
+            .range(fromIdx, toIdx)
+          if (error) throw error
+          const batch = data || []
+          all = all.concat(batch)
+          if (batch.length < pageSize) break
+          fromIdx += pageSize
+        }
+        const map = {}
+        for (const r of all) {
+          const name = r.name ?? r.item_name
+          if (!name) continue
+          if (r.id) map[r.id] = name
+          if (r.item_id) map[r.item_id] = name
+          if (r.code) map[r.code] = name
+          if (r.slug) map[r.slug] = name
+        }
+        setItemsMap(map)
+      } catch (e) {
+        // ignore failures; will fallback to existing fields
+      }
+    }
+    fetchItems()
+  }, [])
+  const rows = dataDelivered.map(o => {
+    const receivedRaw = o.createdAt ?? o.created_at ?? o.receivedAt ?? o.received_at
+    const deliveredRaw = o.deliveredAt ?? o.delivered_at ?? o.updated_at ?? o.created_at ?? o.createdAt
+    const token = o.token_no ?? o.order_token ?? null
+    const resolvedItem = (
+      o.item_name ??
+      itemsMap[o.item_id] ?? itemsMap[o.itemId] ?? itemsMap[o.item] ??
+      o.items ?? 'Item'
+    )
+    return {
+      id: o.id,
+      item: resolvedItem,
+      qty: 1,
+      total: o.total,
+      status: o.status,
+      receivedTs: toValidMs(receivedRaw),
+      deliveredTs: toValidMs(deliveredRaw),
+      token,
+    }
+  })
 
-  const fmt = (ts) => new Date(ts).toISOString().slice(0,10)
+  const fmt = (ms) => {
+    if (!ms) return ''
+    const d = new Date(ms)
+    return isNaN(d) ? '' : d.toISOString().slice(0,10)
+  }
   const filtered = rows.filter(r => {
+    if (!r.deliveredTs) return false
     const d = fmt(r.deliveredTs)
-    return d >= from && d <= to
+    return d && d >= from && d <= to
   })
   const displayRows = [...filtered].sort((a,b) => b.deliveredTs - a.deliveredTs).slice(0, 5)
   const totals = filtered.reduce((acc, r) => {
@@ -1008,13 +1351,16 @@ function ReportsPage() {
   }, { orders: 0, revenue: 0, items: 0, PENDING: 0, PREPARING: 0, READY: 0 })
 
   const exportCsv = () => {
-    const header = ['Order ID', 'Item', 'Total', 'Received At', 'Delivered At']
+    const header = ['Order Token', 'Item', 'Total', 'Received At', 'Delivered At']
     const esc = (v) => '"' + String(v).replace(/"/g, '""') + '"'
-    const isoNoMs = (ts) => new Date(ts)
-      .toISOString()
-      .replace(/\.\d{3}Z$/, '') // remove milliseconds and trailing Z
+    const isoNoMs = (ms) => {
+      if (!ms) return ''
+      const d = new Date(ms)
+      if (isNaN(d)) return ''
+      return d.toISOString().replace(/\.\d{3}Z$/, '')
+    }
     const lines = filtered.map(r => [
-      esc(r.id),
+      esc(r.token ? ('#' + r.token) : ''),
       esc(r.item),
       esc(r.total),
       esc(isoNoMs(r.receivedTs)),
@@ -1033,10 +1379,15 @@ function ReportsPage() {
 
   const exportExcel = () => {
     const esc = (v) => String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    const isoNoMs = (ts) => new Date(ts).toISOString().replace(/\.\d{3}Z$/, '')
+    const isoNoMs = (ms) => {
+      if (!ms) return ''
+      const d = new Date(ms)
+      if (isNaN(d)) return ''
+      return d.toISOString().replace(/\.\d{3}Z$/, '')
+    }
     const rowsHtml = filtered.map(r => `
       <tr>
-        <td>${esc(r.id)}</td>
+        <td>${esc(r.token ? ('#' + r.token) : '')}</td>
         <td>${esc(r.item)}</td>
         <td>${esc(r.total)}</td>
         <td class="text">${esc(isoNoMs(r.receivedTs))}</td>
@@ -1120,7 +1471,7 @@ function ReportsPage() {
         <table className="table">
           <thead>
             <tr>
-              <th>Order ID</th>
+              <th>Order Token</th>
               <th>Item</th>
               <th>Total</th>
               <th>Received</th>
@@ -1130,7 +1481,7 @@ function ReportsPage() {
           <tbody>
             {displayRows.map((r) => (
               <tr key={r.id}>
-                <td>{r.id}</td>
+                <td>{r.token ? ('#' + r.token) : ''}</td>
                 <td>{r.item}</td>
                 <td>₹{r.total}</td>
                 <td>{new Date(r.receivedTs).toLocaleString()}</td>
