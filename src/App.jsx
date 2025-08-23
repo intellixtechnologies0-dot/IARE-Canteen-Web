@@ -195,6 +195,60 @@ function DashboardShell() {
           // If order_token table or columns don't exist, continue gracefully
           console.warn('Token merge skipped:', e?.message || e)
         }
+        // Merge item prices from order_items (fallback to food_items)
+        try {
+          const itemIds = Array.from(new Set((all || []).map(o => o.item_id || o.itemId || o.item).filter(Boolean)))
+          if (itemIds.length > 0) {
+            let priceMap = Object.create(null)
+            // Try order_items first
+            try {
+              const { data: rows, error: e1 } = await supabase
+                .from('order_items')
+                .select('*')
+                .in('id', itemIds)
+              if (e1) throw e1
+              for (const r of rows || []) {
+                const key = r.id || r.item_id || r.code || r.slug
+                const val = r.price ?? r.cost ?? r.rate ?? r.amount
+                if (key && typeof val === 'number') priceMap[key] = val
+              }
+              // If we didn't find all keys, try matching on item_id too
+              const missing = itemIds.filter(id => priceMap[id] == null)
+              if (missing.length > 0) {
+                const { data: rows2 } = await supabase
+                  .from('order_items')
+                  .select('*')
+                  .in('item_id', missing)
+                for (const r of rows2 || []) {
+                  const key = r.item_id || r.id || r.code || r.slug
+                  const val = r.price ?? r.cost ?? r.rate ?? r.amount
+                  if (key && typeof val === 'number') priceMap[key] = val
+                }
+              }
+            } catch (_) {
+              // Fallback to food_items
+              const { data: rows, error: e2 } = await supabase
+                .from('food_items')
+                .select('*')
+                .in('id', itemIds)
+              if (!e2) {
+                for (const r of rows || []) {
+                  const key = r.id || r.item_id || r.code || r.slug
+                  const val = r.price ?? r.cost ?? r.rate ?? r.amount
+                  if (key && typeof val === 'number') priceMap[key] = val
+                }
+              }
+            }
+            // Apply resolved prices if total is missing/null
+            all = all.map(o => {
+              const key = o.item_id || o.itemId || o.item
+              const resolved = priceMap[key]
+              return resolved != null && (o.total == null || Number.isNaN(o.total)) ? { ...o, total: resolved } : o
+            })
+          }
+        } catch (e) {
+          console.warn('Price merge skipped:', e?.message || e)
+        }
         // Split into live and past
         const live = (all || []).filter((o) => normStatus(o.status) !== 'DELIVERED')
         const past = (all || []).filter((o) => normStatus(o.status) === 'DELIVERED')
@@ -242,6 +296,40 @@ function DashboardShell() {
             if (val) enriched = { ...enriched, token_no: val, order_token: val }
           }
         } catch (e) {}
+        // Enrich price if missing using order_items/food_items
+        try {
+          if (enriched && (enriched.total == null || Number.isNaN(enriched.total))) {
+            const key = enriched.item_id || enriched.itemId || enriched.item
+            if (key) {
+              let price = null
+              try {
+                const { data: rows, error } = await supabase
+                  .from('order_items')
+                  .select('*')
+                  .or(`id.eq.${key},item_id.eq.${key}`)
+                if (!error) {
+                  const r = (rows || [])[0]
+                  price = r ? (r.price ?? r.cost ?? r.rate ?? r.amount ?? null) : null
+                }
+              } catch (_) {}
+              if (price == null) {
+                try {
+                  const { data: rows2, error: e2 } = await supabase
+                    .from('food_items')
+                    .select('*')
+                    .or(`id.eq.${key},item_id.eq.${key}`)
+                  if (!e2) {
+                    const r2 = (rows2 || [])[0]
+                    price = r2 ? (r2.price ?? r2.cost ?? r2.rate ?? r2.amount ?? null) : null
+                  }
+                } catch (_) {}
+              }
+              if (typeof price === 'number') {
+                enriched = { ...enriched, total: price }
+              }
+            }
+          }
+        } catch (_) {}
         setOrders((prev) => [enriched, ...prev])
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'orders' }, async (payload) => {
@@ -866,7 +954,7 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {},
           <tr>
             <th>{idHeader}</th>
             <th>Item Name</th>
-            <th>Total</th>
+            <th>Price</th>
             <th>Status</th>
             <th>Placed By</th>
             <th>Actions</th>
@@ -877,7 +965,7 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {},
             <tr key={o.id}>
               <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>{(o.token_no || o.order_token) ? ('#' + (o.token_no || o.order_token)) : 'Not available'}</span></td>
               <td><strong>{o.item_name}</strong></td>
-              <td>₹{o.total}</td>
+              <td>{o.price != null ? `₹${o.price}` : (o.total != null ? `₹${o.total}` : '-')}</td>
               <td>
                 {normStatus(o.status) === 'PENDING' && <span className="badge pending">PENDING</span>}
                 {normStatus(o.status) === 'PREPARING' && <span className="badge preparing">PREPARING</span>}
@@ -1068,7 +1156,7 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
               <tr>
                 <th>Token No</th>
                 <th>Item Name</th>
-                <th>Total</th>
+                <th>Price</th>
                 <th>Status</th>
               </tr>
             </thead>
@@ -1077,7 +1165,7 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
                 <tr key={o.id}>
                   <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>{(o.token_no || o.order_token) ? ('#' + (o.token_no || o.order_token)) : 'Not available'}</span></td>
                   <td><strong>{o.item_name}</strong></td>
-                  <td>₹{o.total}</td>
+                  <td>{o.price != null ? `₹${o.price}` : (o.total != null ? `₹${o.total}` : '-')}</td>
                   <td><span className="badge ready">DELIVERED</span></td>
                 </tr>
               ))}
