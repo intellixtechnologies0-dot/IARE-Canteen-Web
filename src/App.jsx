@@ -2144,6 +2144,17 @@ function QRScanPage() {
     if (!text) return {}
     const cleaned = String(text).trim()
     const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i
+    // Try URL parsing first
+    try {
+      const url = new URL(cleaned)
+      const params = url.searchParams
+      const cand = params.get('token') || params.get('id') || params.get('order_id') || params.get('orderId')
+      if (cand) {
+        if (uuidRe.test(cand)) return { orderId: cand }
+        const onlyDigits = cand.replace(/\D+/g, '')
+        if (onlyDigits.length >= 3 && onlyDigits.length <= 10) return { token: onlyDigits }
+      }
+    } catch (_) { /* not a URL */ }
     const uuidMatch = cleaned.match(uuidRe)
     if (uuidMatch) return { orderId: uuidMatch[0] }
     // extract first 3-6 digit token
@@ -2184,6 +2195,7 @@ function QRScanPage() {
         }
       }
       if (!found && orderId) {
+        // Try as direct orders.id first
         const { data: orderRow, error: orderErr } = await supabase
           .from('orders')
           .select('*')
@@ -2191,7 +2203,7 @@ function QRScanPage() {
           .maybeSingle()
         if (orderErr) throw orderErr
         if (orderRow) {
-          // try to resolve token
+          // resolve token
           const { data: tokRow } = await supabase
             .from('order_token')
             .select('order_token')
@@ -2199,6 +2211,24 @@ function QRScanPage() {
             .maybeSingle()
           resolvedToken = tokRow?.order_token || null
           found = { ...orderRow, token_no: resolvedToken, order_token: resolvedToken }
+        } else {
+          // If not an order id, it might be order_token.id
+          const { data: tokById } = await supabase
+            .from('order_token')
+            .select('order_id, order_token')
+            .eq('id', orderId)
+            .maybeSingle()
+          if (tokById && tokById.order_id) {
+            const { data: orderRow2 } = await supabase
+              .from('orders')
+              .select('*')
+              .eq('id', tokById.order_id)
+              .maybeSingle()
+            if (orderRow2) {
+              resolvedToken = tokById.order_token || null
+              found = { ...orderRow2, token_no: resolvedToken, order_token: resolvedToken }
+            }
+          }
         }
       }
       if (found) setOrder(found)
