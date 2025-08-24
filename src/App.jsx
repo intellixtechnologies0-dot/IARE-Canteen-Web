@@ -1,7 +1,8 @@
 import './App.css'
 import { NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useState, useRef } from 'react'
 import supabase from './lib/supabaseClient'
+import { BrowserQRCodeReader } from '@zxing/browser'
 
 // Normalize status for UI comparisons (handles lowercase/uppercase from DB)
 const normStatus = (s) => String(s || '').toUpperCase()
@@ -51,6 +52,7 @@ function DashboardShell() {
     '/orders': 'Orders',
     '/inventory': 'Inventory Management',
     '/manage-quantity': 'Manage Quantity',
+    '/scan': 'Scan QR',
     '/reports': 'Reports',
     '/ai': 'AI Predictions',
     '/settings': 'Settings',
@@ -442,6 +444,7 @@ function DashboardShell() {
           <NavLink to="/orders">Orders</NavLink>
           <NavLink to="/inventory">Inventory Management</NavLink>
           <NavLink to="/manage-quantity">Manage Quantity</NavLink>
+          <NavLink to="/scan">Scan QR</NavLink>
           <NavLink to="/reports">Reports</NavLink>
           <NavLink to="/ai">AI Predictions</NavLink>
           <NavLink to="/settings">Settings</NavLink>
@@ -492,6 +495,7 @@ function DashboardShell() {
           <Route path="/orders" element={<OrdersPage orders={orders} deliveredOrders={delivered} activity={activity} onUpdateStatus={updateOrderStatus} onRevert={revertActivity} view={ordersView} pictureMode={ordersPictureMode} updatingIds={updatingIds} />} />
           <Route path="/inventory" element={<InventoryPage />} />
           <Route path="/manage-quantity" element={<ManageQuantityPage />} />
+          <Route path="/scan" element={<QRScanPage />} />
           <Route path="/reports" element={<ReportsPage />} />
           <Route path="/ai" element={<AIPredictionsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
@@ -2080,6 +2084,203 @@ function DebugPanel() {
         )}
         {!result && !error && !envInfo && <div className="muted">No result yet. Click fetch to test.</div>}
       </div>
+    </div>
+  )
+}
+
+function QRScanPage() {
+  const videoRef = useRef(null)
+  const codeReaderRef = useRef(null)
+  const [scanning, setScanning] = useState(false)
+  const [scanText, setScanText] = useState('')
+  const [error, setError] = useState(null)
+  const [order, setOrder] = useState(null)
+  const [updating, setUpdating] = useState(false)
+
+  const stop = async () => {
+    try {
+      setScanning(false)
+      if (codeReaderRef.current) {
+        await codeReaderRef.current.reset()
+        codeReaderRef.current = null
+      }
+      const el = videoRef.current
+      if (el && el.srcObject) {
+        const tracks = el.srcObject.getTracks()
+        tracks.forEach(t => t.stop())
+        el.srcObject = null
+      }
+    } catch (_) {}
+  }
+
+  const start = async () => {
+    setError(null)
+    setOrder(null)
+    setScanText('')
+    try {
+      const reader = new BrowserQRCodeReader()
+      codeReaderRef.current = reader
+      setScanning(true)
+      await reader.decodeFromVideoDevice(null, videoRef.current, async (result, err, controls) => {
+        if (result) {
+          const text = String(result.getText() || '')
+          setScanText(text)
+          controls.stop()
+          await stop()
+          fetchOrderForScan(text)
+        }
+        if (err && err.name === 'NotFoundException') {
+          // keep scanning silently
+        }
+      })
+    } catch (e) {
+      console.error(e)
+      setError(e)
+      setScanning(false)
+    }
+  }
+
+  const parseTokenOrId = (text) => {
+    if (!text) return {}
+    const cleaned = String(text).trim()
+    const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i
+    const uuidMatch = cleaned.match(uuidRe)
+    if (uuidMatch) return { orderId: uuidMatch[0] }
+    // extract first 3-6 digit token
+    const tokenRe = /(token|tk|id|order|#|^|\b)\D*([0-9]{3,6})/i
+    const m = cleaned.match(tokenRe)
+    if (m) return { token: m[2] }
+    // if plain digits
+    const digits = cleaned.replace(/\D+/g, '')
+    if (digits.length >= 3 && digits.length <= 10) return { token: digits }
+    return {}
+  }
+
+  const fetchOrderForScan = async (text) => {
+    setError(null)
+    setOrder(null)
+    const { token, orderId } = parseTokenOrId(text)
+    try {
+      let found = null
+      let resolvedToken = token || null
+      if (token) {
+        // find by order_token
+        const { data: tokRow, error: tokErr } = await supabase
+          .from('order_token')
+          .select('order_id, order_token')
+          .eq('order_token', token)
+          .maybeSingle()
+        if (tokErr) throw tokErr
+        if (tokRow && tokRow.order_id) {
+          const { data: orderRow, error: orderErr } = await supabase
+            .from('orders')
+            .select('*')
+            .eq('id', tokRow.order_id)
+            .maybeSingle()
+          if (orderErr) throw orderErr
+          if (orderRow) {
+            found = { ...orderRow, token_no: tokRow.order_token, order_token: tokRow.order_token }
+          }
+        }
+      }
+      if (!found && orderId) {
+        const { data: orderRow, error: orderErr } = await supabase
+          .from('orders')
+          .select('*')
+          .eq('id', orderId)
+          .maybeSingle()
+        if (orderErr) throw orderErr
+        if (orderRow) {
+          // try to resolve token
+          const { data: tokRow } = await supabase
+            .from('order_token')
+            .select('order_token')
+            .eq('order_id', orderRow.id)
+            .maybeSingle()
+          resolvedToken = tokRow?.order_token || null
+          found = { ...orderRow, token_no: resolvedToken, order_token: resolvedToken }
+        }
+      }
+      if (found) setOrder(found)
+      else setError(new Error('No order found for scanned code'))
+    } catch (e) {
+      console.error('Scan lookup failed:', e)
+      setError(e)
+    }
+  }
+
+  const updateStatus = async (next) => {
+    if (!order) return
+    setUpdating(true)
+    try {
+      const { error } = await supabase.rpc('update_order_status', {
+        p_order_id: order.id,
+        p_new_status: String(next).toLowerCase(),
+      })
+      if (error) throw error
+      setOrder(o => ({ ...o, status: next }))
+      alert(`Updated to ${next}`)
+    } catch (e) {
+      alert('Failed to update: ' + (e.message || e))
+    } finally {
+      setUpdating(false)
+    }
+  }
+
+  useEffect(() => {
+    // auto-start on mount
+    start()
+    return () => { stop() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  return (
+    <div style={{ display: 'grid', gap: 16 }}>
+      <Card title="QR Scanner">
+        <div className="actions" style={{ marginBottom: 8 }}>
+          <button className="btn" onClick={scanning ? stop : start}>{scanning ? 'Stop' : 'Start'} Camera</button>
+          <button className="btn" onClick={() => { stop(); start() }}>Rescan</button>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          <div>
+            <video ref={videoRef} style={{ width: '100%', maxHeight: 320, background: '#000', borderRadius: 8 }} muted playsInline />
+            {scanText && <div className="muted" style={{ marginTop: 8 }}>Scanned: {scanText}</div>}
+            {error && <div className="muted" style={{ color: 'crimson', marginTop: 8 }}>{String(error.message || error)}</div>}
+          </div>
+          <div>
+            {!order ? (
+              <div className="muted">Scan a QR that contains an order token or ID.</div>
+            ) : (
+              <div>
+                <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontFamily: 'monospace', color: '#666' }}>Token: {order.token_no || order.order_token ? ('#' + (order.token_no || order.order_token)) : 'Not available'}</div>
+                  <div><strong>{order.item_name || 'Order Item'}</strong></div>
+                  <div>Status: {normStatus(order.status)}</div>
+                  <div>Price: {order.price != null ? `₹${order.price}` : (order.total != null ? `₹${order.total}` : '-')}</div>
+                  <div>Placed By: {order.order_placer === 'admin' ? 'Counter' : 'Student'}</div>
+                </div>
+                <div className="actions">
+                  {normStatus(order.status) === 'PENDING' && (
+                    <button className="btn" disabled={updating} onClick={() => updateStatus('PREPARING')}>{updating ? 'Updating...' : 'Mark Preparing'}</button>
+                  )}
+                  {normStatus(order.status) === 'PREPARING' && (
+                    <>
+                      <button className="btn" disabled={updating} onClick={() => updateStatus('READY')}>{updating ? 'Updating...' : 'Mark Ready'}</button>
+                      <button className="btn" disabled={updating} onClick={() => updateStatus('DELIVERED')}>{updating ? 'Updating...' : 'Mark Delivered'}</button>
+                    </>
+                  )}
+                  {normStatus(order.status) === 'READY' && (
+                    <button className="btn" disabled={updating} onClick={() => updateStatus('DELIVERED')}>{updating ? 'Updating...' : 'Mark Delivered'}</button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="muted" style={{ marginTop: 8 }}>
+          Tip: Your QR can contain either the order token (e.g., #1234) or the exact order UUID.
+        </div>
+      </Card>
     </div>
   )
 }
