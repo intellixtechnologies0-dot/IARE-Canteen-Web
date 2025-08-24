@@ -2091,19 +2091,34 @@ function DebugPanel() {
 function QRScanPage() {
   const videoRef = useRef(null)
   const codeReaderRef = useRef(null)
+  const controlsRef = useRef(null)
   const [scanning, setScanning] = useState(false)
   const [scanText, setScanText] = useState('')
   const [error, setError] = useState(null)
   const [order, setOrder] = useState(null)
   const [updating, setUpdating] = useState(false)
+  const [processing, setProcessing] = useState(false)
+  const [lastText, setLastText] = useState('')
+  const [lastScanAt, setLastScanAt] = useState(0)
+  const [scanMessage, setScanMessage] = useState('')
 
   const stop = async () => {
     try {
       setScanning(false)
-      if (codeReaderRef.current) {
-        await codeReaderRef.current.reset()
-        codeReaderRef.current = null
-      }
+      // Stop scanner controls if present
+      try {
+        if (controlsRef.current && typeof controlsRef.current.stop === 'function') {
+          controlsRef.current.stop()
+        }
+      } catch (_) {}
+      controlsRef.current = null
+      // Reset the reader to release camera resources
+      try {
+        if (codeReaderRef.current && typeof codeReaderRef.current.reset === 'function') {
+          await codeReaderRef.current.reset()
+        }
+      } catch (_) {}
+      codeReaderRef.current = null
       const el = videoRef.current
       if (el && el.srcObject) {
         const tracks = el.srcObject.getTracks()
@@ -2117,17 +2132,39 @@ function QRScanPage() {
     setError(null)
     setOrder(null)
     setScanText('')
+    setScanMessage('')
     try {
+      // If already running, do nothing
+      if (scanning) return
+      // Ensure any previous session is stopped
+      await stop()
       const reader = new BrowserQRCodeReader()
       codeReaderRef.current = reader
       setScanning(true)
       await reader.decodeFromVideoDevice(null, videoRef.current, async (result, err, controls) => {
+        try {
+          if (controls && !controlsRef.current) controlsRef.current = controls
+        } catch (_) {}
         if (result) {
           const text = String(result.getText() || '')
-          setScanText(text)
-          controls.stop()
-          await stop()
-          fetchOrderForScan(text)
+          if (!text) return
+          // Skip duplicate rapid scans of same content and concurrent processing
+          if (processing) return
+          const now = Date.now()
+          if (lastText === text && (now - lastScanAt) < 1500) return
+          setProcessing(true)
+          setLastText(text)
+          setLastScanAt(now)
+          try {
+            const found = await fetchOrderForScan(text)
+            if (found) {
+              setScanMessage('Successfully scanned')
+            } else {
+              setScanMessage('')
+            }
+          } finally {
+            setProcessing(false)
+          }
         }
         if (err && err.name === 'NotFoundException') {
           // keep scanning silently
@@ -2148,17 +2185,36 @@ function QRScanPage() {
     try {
       const url = new URL(cleaned)
       const params = url.searchParams
-      const cand = params.get('token') || params.get('id') || params.get('order_id') || params.get('orderId')
+      const cand = (
+        params.get('token') || params.get('token_no') || params.get('id') ||
+        params.get('order_id') || params.get('orderId') || params.get('code') ||
+        params.get('tk') || params.get('t') || params.get('ord')
+      )
       if (cand) {
         if (uuidRe.test(cand)) return { orderId: cand }
         const onlyDigits = cand.replace(/\D+/g, '')
+        if (onlyDigits.length >= 3 && onlyDigits.length <= 10) return { token: onlyDigits }
+      }
+      // Try path segments like /orders/1234 or /o/<uuid>
+      const parts = url.pathname.split('/').filter(Boolean)
+      if (parts.length) {
+        const last = parts[parts.length - 1]
+        if (uuidRe.test(last)) return { orderId: last }
+        const onlyDigits = last.replace(/\D+/g, '')
+        if (onlyDigits.length >= 3 && onlyDigits.length <= 10) return { token: onlyDigits }
+      }
+      // Try hash fragment like #1234 or #<uuid>
+      const hash = (url.hash || '').replace(/^#/, '')
+      if (hash) {
+        if (uuidRe.test(hash)) return { orderId: hash }
+        const onlyDigits = hash.replace(/\D+/g, '')
         if (onlyDigits.length >= 3 && onlyDigits.length <= 10) return { token: onlyDigits }
       }
     } catch (_) { /* not a URL */ }
     const uuidMatch = cleaned.match(uuidRe)
     if (uuidMatch) return { orderId: uuidMatch[0] }
     // extract first 3-6 digit token
-    const tokenRe = /(token|tk|id|order|#|^|\b)\D*([0-9]{3,6})/i
+    const tokenRe = /(token|token_no|tk|t|id|ord|order|#|^|\b)\D*([0-9]{1,12})/i
     const m = cleaned.match(tokenRe)
     if (m) return { token: m[2] }
     // if plain digits
@@ -2175,67 +2231,153 @@ function QRScanPage() {
       let found = null
       let resolvedToken = token || null
       if (token) {
-        // find by order_token
-        const { data: tokRow, error: tokErr } = await supabase
-          .from('order_token')
-          .select('order_id, order_token')
-          .eq('order_token', token)
-          .maybeSingle()
-        if (tokErr) throw tokErr
-        if (tokRow && tokRow.order_id) {
-          const { data: orderRow, error: orderErr } = await supabase
+        // Prefer direct lookup on orders table by order_token/token_no
+        const tokenStr = String(token)
+        const tokenNum = Number.isFinite(Number(tokenStr)) ? Number(tokenStr) : null
+        // 1) orders.order_token as string
+        if (!found) {
+          const { data } = await supabase
             .from('orders')
-            .select('*')
-            .eq('id', tokRow.order_id)
+            .select('id,item_name,item_count,order_token,created_at,status,price,total,order_placer')
+            .eq('order_token', tokenStr)
+            .limit(1)
             .maybeSingle()
-          if (orderErr) throw orderErr
-          if (orderRow) {
-            found = { ...orderRow, token_no: tokRow.order_token, order_token: tokRow.order_token }
+          if (data) {
+            resolvedToken = data.order_token || tokenStr
+            found = { ...data, token_no: resolvedToken, order_token: resolvedToken }
           }
+        }
+        // 2) orders.order_token as number
+        if (!found && tokenNum != null) {
+          const { data } = await supabase
+            .from('orders')
+            .select('id,item_name,item_count,order_token,created_at,status,price,total,order_placer')
+            .eq('order_token', tokenNum)
+            .limit(1)
+            .maybeSingle()
+          if (data) {
+            resolvedToken = data.order_token || tokenStr
+            found = { ...data, token_no: resolvedToken, order_token: resolvedToken }
+          }
+        }
+        // Removed token_no direct checks since orders.token_no column doesn't exist
+        // 5) Fallback: mapping table
+        if (!found) {
+          try {
+            const { data: tokRow } = await supabase
+              .from('order_token')
+              .select('order_id, order_token, token, token_no, token_number')
+              .or(`order_token.eq.${tokenStr},token.eq.${tokenStr},token_no.eq.${tokenStr},token_number.eq.${tokenStr}`)
+              .limit(1)
+              .maybeSingle()
+            if (tokRow && tokRow.order_id) {
+              const { data: orderRow } = await supabase
+                .from('orders')
+                .select('id,item_name,item_count,order_token,created_at,status,price,total,order_placer')
+                .eq('id', tokRow.order_id)
+                .maybeSingle()
+              if (orderRow) {
+                const tokVal = tokRow.order_token || tokRow.token || tokRow.token_no || tokRow.token_number || tokenStr
+                found = { ...orderRow, token_no: tokVal, order_token: tokVal }
+                resolvedToken = tokVal
+              }
+            }
+          } catch (_) {}
+        }
+        // 6) Last-resort fuzzy match on mapping table (handles prefixes like C-1234)
+        if (!found) {
+          try {
+            const like = `%${tokenStr}%`
+            const { data: fuzzy } = await supabase
+              .from('order_token')
+              .select('order_id, order_token, token, token_no, token_number')
+              .or(`order_token.ilike.${like},token.ilike.${like}`)
+              .limit(1)
+              .maybeSingle()
+            if (fuzzy && fuzzy.order_id) {
+              const { data: orderRow } = await supabase
+                .from('orders')
+                .select('id,item_name,item_count,order_token,token_no,created_at,status,price,total,order_placer')
+                .eq('id', fuzzy.order_id)
+                .maybeSingle()
+              if (orderRow) {
+                const tokVal = fuzzy.order_token || fuzzy.token || fuzzy.token_no || fuzzy.token_number || tokenStr
+                found = { ...orderRow, token_no: tokVal, order_token: tokVal }
+                resolvedToken = tokVal
+              }
+            }
+          } catch (_) {}
         }
       }
       if (!found && orderId) {
-        // Try as direct orders.id first
-        const { data: orderRow, error: orderErr } = await supabase
-          .from('orders')
-          .select('*')
-          .eq('id', orderId)
-          .maybeSingle()
-        if (orderErr) throw orderErr
-        if (orderRow) {
-          // resolve token
-          const { data: tokRow } = await supabase
-            .from('order_token')
-            .select('order_token')
-            .eq('order_id', orderRow.id)
+        // Also try if this UUID is stored as orders.order_token
+        if (!found) {
+          const { data: asToken } = await supabase
+            .from('orders')
+            .select('id,item_name,item_count,order_token,created_at,status,price,total,order_placer')
+            .eq('order_token', orderId)
             .maybeSingle()
-          resolvedToken = tokRow?.order_token || null
-          found = { ...orderRow, token_no: resolvedToken, order_token: resolvedToken }
-        } else {
-          // If not an order id, it might be order_token.id
+          if (asToken) {
+            resolvedToken = asToken.order_token || String(orderId)
+            found = { ...asToken, token_no: resolvedToken, order_token: resolvedToken }
+          }
+        }
+        // Try as direct orders.id next
+        if (!found) {
+          const { data: orderRow, error: orderErr } = await supabase
+            .from('orders')
+            .select('id,item_name,item_count,order_token,created_at,status,price,total,order_placer')
+            .eq('id', orderId)
+            .maybeSingle()
+          if (orderErr) throw orderErr
+          if (orderRow) {
+            // resolve token (prefer orders.order_token)
+            if (orderRow.order_token) {
+              resolvedToken = orderRow.order_token
+              found = { ...orderRow, token_no: resolvedToken, order_token: resolvedToken }
+            } else {
+              const { data: tokRow } = await supabase
+                .from('order_token')
+                .select('order_token, token, token_no, token_number')
+                .eq('order_id', orderRow.id)
+                .maybeSingle()
+              resolvedToken = tokRow?.order_token || tokRow?.token || tokRow?.token_no || tokRow?.token_number || null
+              found = { ...orderRow, token_no: resolvedToken, order_token: resolvedToken }
+            }
+          }
+        }
+        // If still not found, it might be order_token.id or order_token.order_token matching the UUID
+        if (!found) {
           const { data: tokById } = await supabase
             .from('order_token')
-            .select('order_id, order_token')
-            .eq('id', orderId)
+            .select('order_id, order_token, token, token_no, token_number')
+            .or(`id.eq.${orderId},order_token.eq.${orderId}`)
             .maybeSingle()
           if (tokById && tokById.order_id) {
             const { data: orderRow2 } = await supabase
               .from('orders')
-              .select('*')
+              .select('id,item_name,item_count,order_token,created_at,status,price,total,order_placer')
               .eq('id', tokById.order_id)
               .maybeSingle()
             if (orderRow2) {
-              resolvedToken = tokById.order_token || null
-              found = { ...orderRow2, token_no: resolvedToken, order_token: resolvedToken }
+              const tokVal = tokById.order_token || tokById.token || tokById.token_no || tokById.token_number || String(orderId)
+              resolvedToken = tokVal
+              found = { ...orderRow2, token_no: tokVal, order_token: tokVal }
             }
           }
         }
       }
-      if (found) setOrder(found)
-      else setError(new Error('No order found for scanned code'))
+      if (found) {
+        setOrder(found)
+        return found
+      } else {
+        setError(new Error('No order found for scanned code'))
+        return null
+      }
     } catch (e) {
       console.error('Scan lookup failed:', e)
       setError(e)
+      return null
     }
   }
 
@@ -2269,12 +2411,11 @@ function QRScanPage() {
       <Card title="QR Scanner">
         <div className="actions" style={{ marginBottom: 8 }}>
           <button className="btn" onClick={scanning ? stop : start}>{scanning ? 'Stop' : 'Start'} Camera</button>
-          <button className="btn" onClick={() => { stop(); start() }}>Rescan</button>
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
           <div>
             <video ref={videoRef} style={{ width: '100%', maxHeight: 320, background: '#000', borderRadius: 8 }} muted playsInline />
-            {scanText && <div className="muted" style={{ marginTop: 8 }}>Scanned: {scanText}</div>}
+            {scanMessage && <div className="muted" style={{ marginTop: 8, color: '#10b981' }}>{scanMessage}</div>}
             {error && <div className="muted" style={{ color: 'crimson', marginTop: 8 }}>{String(error.message || error)}</div>}
           </div>
           <div>
@@ -2283,8 +2424,8 @@ function QRScanPage() {
             ) : (
               <div>
                 <div style={{ marginBottom: 8 }}>
-                  <div style={{ fontFamily: 'monospace', color: '#666' }}>Token: {order.token_no || order.order_token ? ('#' + (order.token_no || order.order_token)) : 'Not available'}</div>
-                  <div><strong>{order.item_name || 'Order Item'}</strong></div>
+                  <div>Item Name: <strong>{order.item_name || 'Order Item'}</strong></div>
+                  <div>Item Count: {order.item_count != null ? order.item_count : (order.qty != null ? order.qty : 1)}</div>
                   <div>Status: {normStatus(order.status)}</div>
                   <div>Price: {order.price != null ? `₹${order.price}` : (order.total != null ? `₹${order.total}` : '-')}</div>
                   <div>Placed By: {order.order_placer === 'admin' ? 'Counter' : 'Student'}</div>
@@ -2314,4 +2455,5 @@ function QRScanPage() {
     </div>
   )
 }
+
 
