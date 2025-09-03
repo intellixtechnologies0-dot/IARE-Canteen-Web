@@ -51,7 +51,7 @@ function DashboardShell() {
     '/place-order': 'Place Order',
     '/orders': 'Orders',
     '/inventory': 'Inventory Management',
-    '/manage-quantity': 'Manage Quantity',
+  
     '/scan': 'Scan QR',
     '/reports': 'Reports',
     '/ai': 'AI Predictions',
@@ -79,7 +79,7 @@ function DashboardShell() {
 
     try {
       // Persist status via RPC
-      const { data, error } = await supabase.rpc('update_order_status', {
+      const { data, error } = await supabase.rpc('update_order_status_flexible', {
         p_order_id: orderId,
         p_new_status: String(nextStatus).toLowerCase(),
       })
@@ -154,6 +154,8 @@ function DashboardShell() {
         
         if (!supabaseUrl || !supabaseKey || supabaseUrl === 'your_supabase_project_url_here') {
           console.warn('Supabase not configured. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in .env file')
+          console.log('Supabase URL:', supabaseUrl)
+          console.log('Supabase Key exists:', !!supabaseKey)
           setConnectionStatus('not-configured')
           return
         }
@@ -172,31 +174,12 @@ function DashboardShell() {
             .range(from, to)
         if (error) throw error
           const batch = data || []
+          console.log('Fetched batch:', batch.length, 'orders')
           all = all.concat(batch)
           if (batch.length < pageSize) break
           from += pageSize
         }
-        // Merge tokens from order_token table if available
-        try {
-          const orderIds = all.map(o => o.id).filter(Boolean)
-          if (orderIds.length > 0) {
-            const { data: tokenRows, error: tokenErr } = await supabase
-              .from('order_token')
-              .select('*')
-              .in('order_id', orderIds)
-            if (tokenErr) throw tokenErr
-            const tokenMap = Object.create(null)
-            for (const r of tokenRows || []) {
-              const key = r.order_id || r.orderId || r.order || r.id
-              const val = r.order_token || r.token || r.token_no || r.token_number || r.id
-              if (key && val) tokenMap[key] = val
-            }
-            all = all.map(o => ({ ...o, token_no: tokenMap[o.id], order_token: tokenMap[o.id] }))
-          }
-        } catch (e) {
-          // If order_token table or columns don't exist, continue gracefully
-          console.warn('Token merge skipped:', e?.message || e)
-        }
+        // order_token is now directly available in the orders table
         // Merge item prices from order_items (fallback to food_items)
         try {
           const itemIds = Array.from(new Set((all || []).map(o => o.item_id || o.itemId || o.item).filter(Boolean)))
@@ -241,11 +224,11 @@ function DashboardShell() {
                 }
               }
             }
-            // Apply resolved prices if total is missing/null
+            // Apply resolved prices if total_amount is missing/null
             all = all.map(o => {
               const key = o.item_id || o.itemId || o.item
               const resolved = priceMap[key]
-              return resolved != null && (o.total == null || Number.isNaN(o.total)) ? { ...o, total: resolved } : o
+              return resolved != null && (o.total_amount == null || Number.isNaN(o.total_amount)) ? { ...o, total_amount: resolved } : o
             })
           }
         } catch (e) {
@@ -254,10 +237,13 @@ function DashboardShell() {
         // Split into live and past
         const live = (all || []).filter((o) => normStatus(o.status) !== 'DELIVERED')
         const past = (all || []).filter((o) => normStatus(o.status) === 'DELIVERED')
+        console.log('Total orders fetched:', all.length)
+        console.log('Live orders:', live.length)
+        console.log('Past orders:', past.length)
+        console.log('Sample order:', all[0])
         setOrders(live)
         setDelivered(past)
         setConnectionStatus('connected')
-        console.log('Successfully fetched orders:', data?.length || 0, 'orders')
       } catch (err) {
         console.error('Supabase orders fetch failed:', err)
         setConnectionStatus('error')
@@ -287,17 +273,7 @@ function DashboardShell() {
           }
         }
         let enriched = payload.new
-        try {
-          const { data: tokenRow } = await supabase
-            .from('order_token')
-            .select('*')
-            .eq('order_id', enriched.id)
-            .maybeSingle()
-          if (tokenRow) {
-            const val = tokenRow.order_token || tokenRow.token || tokenRow.token_no || tokenRow.token_number || tokenRow.id
-            if (val) enriched = { ...enriched, token_no: val, order_token: val }
-          }
-        } catch (e) {}
+        // order_token is now directly available in the orders table
         // Enrich price if missing using order_items/food_items
         try {
           if (enriched && (enriched.total == null || Number.isNaN(enriched.total))) {
@@ -327,7 +303,7 @@ function DashboardShell() {
                 } catch (_) {}
               }
               if (typeof price === 'number') {
-                enriched = { ...enriched, total: price }
+                enriched = { ...enriched, total_amount: price }
               }
             }
           }
@@ -395,7 +371,7 @@ function DashboardShell() {
       setRecent((prev) => [{ orderId, itemName: found.item_name, from: to, to: from, ts: Date.now() }, ...prev])
       // persist to backend so realtime reflects across clients
       try {
-        await supabase.rpc('update_order_status', {
+        await supabase.rpc('update_order_status_flexible', {
           p_order_id: orderId,
           p_new_status: String(from).toLowerCase(),
         })
@@ -410,7 +386,7 @@ function DashboardShell() {
         setRecent((prev) => [{ orderId, itemName, from: to, to: from, ts: Date.now() }, ...prev])
       } catch (_) { /* ignore */ }
       try {
-        await supabase.rpc('update_order_status', {
+        await supabase.rpc('update_order_status_flexible', {
           p_order_id: orderId,
           p_new_status: String(from).toLowerCase(),
         })
@@ -443,7 +419,7 @@ function DashboardShell() {
           <NavLink to="/place-order">Place Order</NavLink>
           <NavLink to="/orders">Orders</NavLink>
           <NavLink to="/inventory">Inventory Management</NavLink>
-          <NavLink to="/manage-quantity">Manage Quantity</NavLink>
+  
           <NavLink to="/scan">Scan QR</NavLink>
           <NavLink to="/reports">Reports</NavLink>
           <NavLink to="/ai">AI Predictions</NavLink>
@@ -494,7 +470,7 @@ function DashboardShell() {
           <Route path="/place-order" element={<PlaceOrderPage />} />
           <Route path="/orders" element={<OrdersPage orders={orders} deliveredOrders={delivered} activity={activity} onUpdateStatus={updateOrderStatus} onRevert={revertActivity} view={ordersView} pictureMode={ordersPictureMode} updatingIds={updatingIds} />} />
           <Route path="/inventory" element={<InventoryPage />} />
-          <Route path="/manage-quantity" element={<ManageQuantityPage />} />
+  
           <Route path="/scan" element={<QRScanPage />} />
           <Route path="/reports" element={<ReportsPage />} />
           <Route path="/ai" element={<AIPredictionsPage />} />
@@ -548,6 +524,7 @@ function HomePage({ orders, recent = [], onUpdateStatus, updatingIds = {} }) {
         const mapped = all.map((r) => {
           const name = r.name ?? r.item_name ?? r.title ?? r.label ?? 'Item'
           const inStock = (
+            (typeof r.available_quantity === 'number' ? r.available_quantity > 0 : undefined) ??
             r.in_stock ?? r.available ?? r.is_available ?? (typeof r.stock === 'number' ? r.stock > 0 : undefined) ??
             (typeof r.status === 'string' ? String(r.status).toLowerCase() === 'in' : undefined) ?? true
           )
@@ -689,7 +666,7 @@ function PlaceOrderPage() {
         const to = from + pageSize - 1
         const { data, error } = await supabase
           .from('orders')
-          .select('id, item_name, status, order_placer, created_at')
+          .select('id, item_name, status, order_placer, created_at, order_token')
           .eq('order_placer', 'admin')
           .order('created_at', { ascending: false })
           .range(from, to)
@@ -699,26 +676,7 @@ function PlaceOrderPage() {
         if (batch.length < pageSize) break
         from += pageSize
       }
-      // Merge tokens from order_token table
-      try {
-        const ids = all.map(o => o.id).filter(Boolean)
-        if (ids.length > 0) {
-          const { data: tokenRows, error: tokenErr } = await supabase
-            .from('order_token')
-            .select('*')
-            .in('order_id', ids)
-          if (tokenErr) throw tokenErr
-          const tokenMap = Object.create(null)
-          for (const r of tokenRows || []) {
-            const key = r.order_id || r.orderId || r.order || r.id
-            const val = r.order_token || r.token || r.token_no || r.token_number || r.id
-            if (key && val) tokenMap[key] = val
-          }
-          all = all.map(o => ({ ...o, token_no: tokenMap[o.id], order_token: tokenMap[o.id] }))
-        }
-      } catch (e) {
-        // ignore token merge errors
-      }
+      // order_token is now directly available in the orders table
       setCounterTokens(all)
     } catch (e) {
       console.error('Failed to fetch Counter tokens:', e)
@@ -739,7 +697,7 @@ function PlaceOrderPage() {
       // Try primary RPC path
       const { data, error } = await supabase.rpc('create_order', {
         p_item_name: item.name,
-        p_total: item.price,
+        p_total_amount: item.price,
         p_status: 'PENDING',
         p_order_placer: 'admin'
       })
@@ -755,25 +713,25 @@ function PlaceOrderPage() {
           .insert({
             id: createdId,
             item_name: item.name,
-            total: item.price,
+            total_amount: item.price,
             status: 'PENDING',
             order_placer: 'admin',
           })
         if (insErr) throw insErr
       }
 
-      // Fetch token from order_token table if available
+      // Get token from the created order
       let tokenVal = createdId
       try {
-        const { data: tokenRow } = await supabase
-          .from('order_token')
-          .select('*')
-          .eq('order_id', createdId)
+        const { data: orderData } = await supabase
+          .from('orders')
+          .select('order_token')
+          .eq('id', createdId)
           .maybeSingle()
-        if (tokenRow) {
-          tokenVal = tokenRow.token || tokenRow.token_no || tokenRow.token_number || tokenRow.order_token || tokenRow.id || data
+        if (orderData && orderData.order_token) {
+          tokenVal = orderData.order_token
         }
-      } catch (e) { /* ignore and fallback to data */ }
+      } catch (e) { /* ignore and fallback to createdId */ }
       setLastToken(tokenVal)
       alert(`Order placed successfully! Token No: #${tokenVal}`)
       
@@ -969,7 +927,7 @@ function OrdersTable({ withTitle = true, orders = [], onUpdateStatus = () => {},
             <tr key={o.id}>
               <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>{(o.token_no || o.order_token) ? ('#' + (o.token_no || o.order_token)) : 'Not available'}</span></td>
               <td><strong>{o.item_name}</strong></td>
-              <td>{o.price != null ? `₹${o.price}` : (o.total != null ? `₹${o.total}` : '-')}</td>
+              <td>{o.total_amount != null ? `₹${o.total_amount}` : '-'}</td>
               <td>
                 {normStatus(o.status) === 'PENDING' && <span className="badge pending">PENDING</span>}
                 {normStatus(o.status) === 'PREPARING' && <span className="badge preparing">PREPARING</span>}
@@ -1169,7 +1127,7 @@ function OrdersPage({ orders, deliveredOrders = [], activity = [], onUpdateStatu
                 <tr key={o.id}>
                   <td><span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#666' }}>{(o.token_no || o.order_token) ? ('#' + (o.token_no || o.order_token)) : 'Not available'}</span></td>
                   <td><strong>{o.item_name}</strong></td>
-                  <td>{o.price != null ? `₹${o.price}` : (o.total != null ? `₹${o.total}` : '-')}</td>
+                  <td>{o.total_amount != null ? `₹${o.total_amount}` : '-'}</td>
                   <td><span className="badge ready">DELIVERED</span></td>
                 </tr>
               ))}
@@ -1191,7 +1149,7 @@ function InventoryPage() {
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('all') // all | in | out
   const [idField, setIdField] = useState('id')
-  const [availabilityField, setAvailabilityField] = useState('in_stock')
+  const [availabilityField, setAvailabilityField] = useState('available_quantity')
   const [selectedIds, setSelectedIds] = useState(() => new Set())
 
   // Fetch all items from Supabase table `food_items`
@@ -1216,20 +1174,30 @@ function InventoryPage() {
         // Detect backend id and availability field from sample row
         const sample = all[0] || {}
         const idCandidates = ['id', 'item_id', 'slug', 'code']
-        const availCandidates = ['in_stock', 'available', 'is_available', 'stock', 'status']
+        const availCandidates = ['available_quantity', 'in_stock', 'available', 'is_available', 'stock', 'status']
         const detectedIdField = idCandidates.find(k => Object.prototype.hasOwnProperty.call(sample, k)) || 'id'
         const detectedAvailField = availCandidates.find(k => Object.prototype.hasOwnProperty.call(sample, k)) || 'in_stock'
         setIdField(detectedIdField)
         setAvailabilityField(detectedAvailField)
-        // Map backend rows to local shape { id, name, inStock }
+        // Map backend rows to local shape with quantity information
         const mapped = all.map((r) => {
           const id = r[detectedIdField] ?? String(Math.random()).slice(2)
           const name = r.name ?? r.item_name ?? r.title ?? r.label ?? 'Item'
+          const price = r.price ?? r.cost ?? 0
+          const availableQuantity = r.available_quantity ?? r.quantity ?? r.stock ?? 0
           const inStock = (
+            (typeof availableQuantity === 'number' ? availableQuantity > 0 : undefined) ??
             r.in_stock ?? r.available ?? r.is_available ?? (typeof r.stock === 'number' ? r.stock > 0 : undefined) ??
             (typeof r.status === 'string' ? String(r.status).toLowerCase() === 'in' : undefined) ?? true
           )
-          return { id, name, inStock: !!inStock }
+          return { 
+            id, 
+            name, 
+            price,
+            availableQuantity,
+            inStock: !!inStock,
+            originalData: r
+          }
         })
         setItems(mapped)
       } catch (e) {
@@ -1262,6 +1230,8 @@ function InventoryPage() {
         update[availabilityField] = inStock ? 1 : 0
       } else if (availabilityField === 'status') {
         update[availabilityField] = inStock ? 'in' : 'out'
+      } else if (availabilityField === 'available_quantity') {
+        update[availabilityField] = inStock ? 1 : 0
       } else {
         update[availabilityField] = !!inStock
       }
@@ -1275,6 +1245,29 @@ function InventoryPage() {
       // Rollback on error
       setItems(prev)
       alert('Failed to update in backend. Please try again.')
+    }
+  }
+
+  const updateQuantity = async (id, newQuantity) => {
+    // Optimistic update
+    const prev = items
+    setItems((p) => p.map((it) => (it.id === id ? { ...it, availableQuantity: newQuantity, inStock: newQuantity > 0 } : it)))
+    try {
+      const target = items.find((it) => it.id === id)
+      if (target && target._local) {
+        // Local-only item: skip backend update
+        return
+      }
+      const { error } = await supabase
+        .from('food_items')
+        .update({ available_quantity: newQuantity })
+        .eq(idField, id)
+      if (error) throw error
+    } catch (e) {
+      console.error('Failed to update quantity in Supabase:', e)
+      // Rollback on error
+      setItems(prev)
+      alert('Failed to update quantity in backend. Please try again.')
     }
   }
 
@@ -1321,19 +1314,62 @@ function InventoryPage() {
 
   return (
     <div style={{ display: 'grid', gap: 16 }}>
-      <div className="grid-3">
-        <Card title="Total Items">
-          <div className="stat-value">{items.length}</div>
-          <div className="stat-label">All items</div>
-        </Card>
-        <Card title="In Stock">
-          <div className="stat-value">{items.filter(i => i.inStock).length}</div>
-          <div className="stat-label">Available</div>
-        </Card>
-        <Card title="Out of Stock">
-          <div className="stat-value">{items.filter(i => !i.inStock).length}</div>
-          <div className="stat-label">Unavailable</div>
-        </Card>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
+        gap: '12px',
+        marginBottom: '16px'
+      }}>
+        <div style={{
+          backgroundColor: '#f8fafc',
+          border: '1px solid #e2e8f0',
+          borderRadius: '8px',
+          padding: '12px',
+          textAlign: 'center'
+        }}>
+          <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#1e293b' }}>{items.length}</div>
+          <div style={{ fontSize: '12px', color: '#64748b' }}>Total</div>
+        </div>
+        <div style={{
+          backgroundColor: '#f0fdf4',
+          border: '1px solid #bbf7d0',
+          borderRadius: '8px',
+          padding: '12px',
+          textAlign: 'center'
+        }}>
+          <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#166534' }}>{items.filter(i => i.inStock).length}</div>
+          <div style={{ fontSize: '12px', color: '#16a34a' }}>In Stock</div>
+        </div>
+        <div style={{
+          backgroundColor: '#fefce8',
+          border: '1px solid #fde047',
+          borderRadius: '8px',
+          padding: '12px',
+          textAlign: 'center'
+        }}>
+          <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#a16207' }}>{items.filter(i => i.inStock && i.availableQuantity <= 20 && i.availableQuantity > 5).length}</div>
+          <div style={{ fontSize: '12px', color: '#ca8a04' }}>Low Stock</div>
+        </div>
+        <div style={{
+          backgroundColor: '#fef2f2',
+          border: '1px solid #fca5a5',
+          borderRadius: '8px',
+          padding: '12px',
+          textAlign: 'center'
+        }}>
+          <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#991b1b' }}>{items.filter(i => i.inStock && i.availableQuantity <= 5 && i.availableQuantity > 0).length}</div>
+          <div style={{ fontSize: '12px', color: '#dc2626' }}>Very Low</div>
+        </div>
+        <div style={{
+          backgroundColor: '#f1f5f9',
+          border: '1px solid #cbd5e1',
+          borderRadius: '8px',
+          padding: '12px',
+          textAlign: 'center'
+        }}>
+          <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#475569' }}>{items.filter(i => !i.inStock).length}</div>
+          <div style={{ fontSize: '12px', color: '#64748b' }}>Out of Stock</div>
+        </div>
       </div>
 
       
@@ -1361,7 +1397,7 @@ function InventoryPage() {
         </div>
       </Card>
 
-      <Card title="Items">
+      <Card title="Food Items Inventory & Quantity Management">
         <div className="actions" style={{ marginBottom: 8 }}>
           <button className="btn" onClick={toggleMarkAllDisplayed}>{allSelected ? 'Unmark All' : 'Mark All'}</button>
         </div>
@@ -1369,8 +1405,10 @@ function InventoryPage() {
           <thead>
             <tr>
               <th>Select</th>
-              <th>Name</th>
-              <th>Status</th>
+              <th>Item Name</th>
+              <th>Price</th>
+              <th>Available Quantity</th>
+              <th>Stock Status</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -1384,19 +1422,58 @@ function InventoryPage() {
                     onChange={(e) => toggleSelect(it.id, e.target.checked)}
                   />
                 </td>
-                <td>{it.name}</td>
+                <td><strong>{it.name}</strong></td>
+                <td>₹{it.price}</td>
                 <td>
-                  {it.inStock ? (
-                    <span className="badge ready">IN STOCK</span>
-                  ) : (
-                    <span className="badge pending">OUT OF STOCK</span>
-                  )}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{
+                      fontSize: '14px',
+                      fontWeight: '600',
+                      color: it.availableQuantity > 20 ? '#10b981' : it.availableQuantity > 5 ? '#f59e0b' : it.availableQuantity > 0 ? '#ef4444' : '#6b7280'
+                    }}>
+                      {it.availableQuantity}
+                    </span>
+                    <input
+                      type="number"
+                      className="input"
+                      style={{ width: 80, fontSize: '12px' }}
+                      value={it.availableQuantity}
+                      onChange={(e) => updateQuantity(it.id, Number(e.target.value))}
+                      min="0"
+                    />
+                  </div>
+                </td>
+                <td>
+                  <span style={{
+                    padding: '4px 8px',
+                    borderRadius: '12px',
+                    fontSize: '12px',
+                    fontWeight: '500',
+                    backgroundColor: it.availableQuantity > 20 ? '#dcfce7' : it.availableQuantity > 5 ? '#fef3c7' : it.availableQuantity > 0 ? '#fee2e2' : '#f3f4f6',
+                    color: it.availableQuantity > 20 ? '#166534' : it.availableQuantity > 5 ? '#92400e' : it.availableQuantity > 0 ? '#991b1b' : '#6b7280'
+                  }}>
+                    {it.availableQuantity > 20 ? '🟢 In Stock' : it.availableQuantity > 5 ? '🟡 Low Stock' : it.availableQuantity > 0 ? '🟠 Very Low' : '🔴 Out of Stock'}
+                  </span>
                 </td>
                 <td className="actions">
+                  <button 
+                    className="btn" 
+                    onClick={() => updateQuantity(it.id, it.availableQuantity + 10)}
+                    style={{ fontSize: '12px', padding: '4px 8px', marginRight: '4px' }}
+                  >
+                    +10
+                  </button>
+                  <button 
+                    className="btn" 
+                    onClick={() => updateQuantity(it.id, Math.max(0, it.availableQuantity - 10))}
+                    style={{ fontSize: '12px', padding: '4px 8px', backgroundColor: '#ef4444', marginRight: '4px' }}
+                  >
+                    -10
+                  </button>
                   {it.inStock ? (
-                    <button className="btn" onClick={() => toggleStock(it.id, false)}>Mark Out of Stock</button>
+                    <button className="btn" onClick={() => toggleStock(it.id, false)}>Mark Out</button>
                   ) : (
-                    <button className="btn" onClick={() => toggleStock(it.id, true)}>Mark In Stock</button>
+                    <button className="btn" onClick={() => toggleStock(it.id, true)}>Mark In</button>
                   )}
                   <button className="btn" onClick={() => deleteItem(it.id)}>Remove</button>
                 </td>
@@ -1413,7 +1490,41 @@ function ReportsPage() {
   const [to, setTo] = useState(() => new Date().toISOString().slice(0, 10))
   const [itemsMap, setItemsMap] = useState({}) // maps food_items id/item_id -> name
   // Build rows dynamically from delivered orders only
-  const dataDelivered = (window.__IARE_DELIVERED__ || [])
+  const [dataDelivered, setDataDelivered] = useState([])
+  
+  // Fetch delivered orders from backend if window variable is empty
+  useEffect(() => {
+    const fetchDeliveredOrders = async () => {
+      try {
+        if (window.__IARE_DELIVERED__ && window.__IARE_DELIVERED__.length > 0) {
+          setDataDelivered(window.__IARE_DELIVERED__)
+          console.log('📊 Reports: Using window.__IARE_DELIVERED__ data')
+        } else {
+          console.log('📊 Reports: Fetching delivered orders from Supabase...')
+          const { data, error } = await supabase
+            .from('orders')
+            .select('*')
+            .eq('status', 'DELIVERED')
+            .order('created_at', { ascending: false })
+          
+          if (error) throw error
+          setDataDelivered(data || [])
+          console.log('📊 Reports: Fetched', data?.length || 0, 'delivered orders from Supabase')
+        }
+      } catch (e) {
+        console.error('❌ Reports: Failed to fetch delivered orders:', e)
+        setDataDelivered([])
+      }
+    }
+    
+    fetchDeliveredOrders()
+  }, [])
+  
+  // Debug: Log delivered orders data structure
+  if (dataDelivered.length > 0) {
+    console.log('📊 Reports: Sample delivered order data:', dataDelivered[0])
+    console.log('📊 Reports: Available fields in delivered orders:', Object.keys(dataDelivered[0] || {}))
+  }
   const toValidMs = (ts) => {
     const d = new Date(ts)
     return isNaN(d) ? null : d.getTime()
@@ -1456,17 +1567,34 @@ function ReportsPage() {
   const rows = dataDelivered.map(o => {
     const receivedRaw = o.createdAt ?? o.created_at ?? o.receivedAt ?? o.received_at
     const deliveredRaw = o.deliveredAt ?? o.delivered_at ?? o.updated_at ?? o.created_at ?? o.createdAt
-    const token = o.token_no ?? o.order_token ?? null
+    // Enhanced token extraction - try multiple possible field names
+    const token = o.token_no ?? o.order_token ?? o.token ?? o.token_number ?? o.id ?? null
+    
+    // Debug: Log token extraction for first few orders
+    if (dataDelivered.indexOf(o) < 3) {
+      console.log('🔍 Reports: Token extraction for order:', {
+        id: o.id,
+        token_no: o.token_no,
+        order_token: o.order_token,
+        token: o.token,
+        token_number: o.token_number,
+        extracted_token: token
+      })
+    }
     const resolvedItem = (
       o.item_name ??
       itemsMap[o.item_id] ?? itemsMap[o.itemId] ?? itemsMap[o.item] ??
       o.items ?? 'Item'
     )
+    // Get the total amount from delivered order - prioritize total_amount, then price
+    const totalAmount = o.total_amount || o.price || 0
     return {
       id: o.id,
       item: resolvedItem,
       qty: 1,
-      total: o.total,
+      total: totalAmount,
+      total_amount: totalAmount, // Ensure we have this for revenue calculation
+      price: totalAmount, // Fallback for price display
       status: o.status,
       receivedTs: toValidMs(receivedRaw),
       deliveredTs: toValidMs(deliveredRaw),
@@ -1487,7 +1615,9 @@ function ReportsPage() {
   const displayRows = [...filtered].sort((a,b) => b.deliveredTs - a.deliveredTs).slice(0, 5)
   const totals = filtered.reduce((acc, r) => {
     acc.orders += 1
-    acc.revenue += r.total
+    // Calculate revenue from delivered items - use total_amount, total, or price
+    const itemRevenue = r.total_amount || r.total || r.price || 0
+    acc.revenue += Number(itemRevenue) || 0
     acc.items += r.qty
     acc[r.status] = (acc[r.status] || 0) + 1
     return acc
@@ -1505,7 +1635,7 @@ function ReportsPage() {
     const lines = filtered.map(r => [
       esc(r.token ? ('#' + r.token) : ''),
       esc(r.item),
-      esc(r.total),
+      esc(r.total_amount || r.total || r.price || 0),
       esc(isoNoMs(r.receivedTs)),
       esc(isoNoMs(r.deliveredTs))
     ].join(','))
@@ -1532,7 +1662,7 @@ function ReportsPage() {
       <tr>
         <td>${esc(r.token ? ('#' + r.token) : '')}</td>
         <td>${esc(r.item)}</td>
-        <td>${esc(r.total)}</td>
+        <td>${esc(r.total_amount || r.total || r.price || 0)}</td>
         <td class="text">${esc(isoNoMs(r.receivedTs))}</td>
         <td class="text">${esc(isoNoMs(r.deliveredTs))}</td>
       </tr>`).join('')
@@ -1598,15 +1728,14 @@ function ReportsPage() {
       <div className="grid-3">
         <Card title="Total Orders">
           <div className="stat-value">{totals.orders}</div>
-          <div className="stat-label">Orders</div>
+          <div className="stat-label">Received</div>
         </Card>
         <Card title="Revenue">
           <div className="stat-value">₹{totals.revenue}</div>
           <div className="stat-label">Total</div>
         </Card>
-        <Card title="Items">
+        <Card title="Delivered Items">
           <div className="stat-value">{totals.items}</div>
-          <div className="stat-label">Sold</div>
         </Card>
       </div>
 
@@ -1626,7 +1755,7 @@ function ReportsPage() {
               <tr key={r.id}>
                 <td>{r.token ? ('#' + r.token) : ''}</td>
                 <td>{r.item}</td>
-                <td>₹{r.total}</td>
+                <td>₹{r.total_amount || r.total || r.price || 0}</td>
                 <td>{new Date(r.receivedTs).toLocaleString()}</td>
                 <td>{new Date(r.deliveredTs).toLocaleString()}</td>
               </tr>
@@ -1638,96 +1767,7 @@ function ReportsPage() {
   )
 }
 
-function ManageQuantityPage() {
-  const [rows, setRows] = useState([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState(null)
 
-  const load = async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const pageSize = 1000
-      let from = 0
-      let all = []
-      while (true) {
-        const to = from + pageSize - 1
-        const { data, error } = await supabase
-          .from('food_items')
-          .select('*')
-          .order('name', { ascending: true })
-          .range(from, to)
-        if (error) throw error
-        const batch = data || []
-        all = all.concat(batch)
-        if (batch.length < pageSize) break
-        from += pageSize
-      }
-      const mapped = all.map(r => ({
-        id: r.id ?? r.item_id ?? r.slug ?? String(Math.random()).slice(2),
-        name: r.name ?? r.item_name ?? 'Item',
-        qty: (typeof r.quantity === 'number' ? r.quantity : (typeof r.stock === 'number' ? r.stock : 0))
-      }))
-      setRows(mapped)
-    } catch (e) {
-      setError(e)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  useEffect(() => { load() }, [])
-
-  const updateQty = async (id, nextQty) => {
-    const prev = rows
-    setRows(r => r.map(x => x.id === id ? { ...x, qty: nextQty } : x))
-    try {
-      const { error } = await supabase
-        .from('food_items')
-        .update({ quantity: Number(nextQty) })
-        .eq('id', id)
-      if (error) throw error
-    } catch (e) {
-      setRows(prev)
-      alert('Failed to update quantity')
-    }
-  }
-
-  return (
-    <div style={{ display: 'grid', gap: 16 }}>
-      <Card title="Food Items Quantity">
-        <div className="actions" style={{ marginBottom: 8 }}>
-          <button className="btn" onClick={load} disabled={loading}>{loading ? 'Refreshing...' : 'Refresh'}</button>
-        </div>
-        {error && <div className="muted" style={{ color: 'crimson' }}>{String(error.message || error)}</div>}
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Item</th>
-              <th>Quantity</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map(r => (
-              <tr key={r.id}>
-                <td><strong>{r.name}</strong></td>
-                <td>
-                  <input
-                    type="number"
-                    className="input"
-                    style={{ width: 120 }}
-                    value={r.qty}
-                    onChange={(e) => updateQty(r.id, Number(e.target.value))}
-                  />
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </Card>
-    </div>
-  )
-}
 
 function AIPredictionsPage() {
   const [date, setDate] = useState(() => new Date().toISOString().slice(0,10))
@@ -2147,6 +2187,7 @@ function QRScanPage() {
         } catch (_) {}
         if (result) {
           const text = String(result.getText() || '')
+          console.log('Scanned text:', text)
           if (!text) return
           // Skip duplicate rapid scans of same content and concurrent processing
           if (processing) return
@@ -2180,198 +2221,143 @@ function QRScanPage() {
   const parseTokenOrId = (text) => {
     if (!text) return {}
     const cleaned = String(text).trim()
+    console.log('Parsing scanned text:', cleaned)
+    
+    // UUID pattern for order IDs
     const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i
-    // Try URL parsing first
+    
+    // Check if it's an encrypted code (starts with IARE_)
+    if (cleaned.startsWith('IARE_')) {
+      console.log('Found encrypted code:', cleaned)
+      return { encryptedCode: cleaned }
+    }
+    
+    // Check if it's a UUID (order ID)
+    const uuidMatch = cleaned.match(uuidRe)
+    if (uuidMatch) {
+      console.log('Found UUID order ID:', uuidMatch[0])
+      return { orderId: uuidMatch[0] }
+    }
+    
+    // Extract digits for token numbers
+    const digits = cleaned.replace(/\D+/g, '')
+    if (digits.length >= 3 && digits.length <= 10) {
+      console.log('Found token number:', digits)
+      return { token: digits }
+    }
+    
+    // If it's a URL, try to extract from parameters
     try {
       const url = new URL(cleaned)
       const params = url.searchParams
-      const cand = (
-        params.get('token') || params.get('token_no') || params.get('id') ||
-        params.get('order_id') || params.get('orderId') || params.get('code') ||
-        params.get('tk') || params.get('t') || params.get('ord')
-      )
+      const cand = params.get('token') || params.get('id') || params.get('order_id') || params.get('code')
       if (cand) {
-        if (uuidRe.test(cand)) return { orderId: cand }
-        const onlyDigits = cand.replace(/\D+/g, '')
-        if (onlyDigits.length >= 3 && onlyDigits.length <= 10) return { token: onlyDigits }
-      }
-      // Try path segments like /orders/1234 or /o/<uuid>
-      const parts = url.pathname.split('/').filter(Boolean)
-      if (parts.length) {
-        const last = parts[parts.length - 1]
-        if (uuidRe.test(last)) return { orderId: last }
-        const onlyDigits = last.replace(/\D+/g, '')
-        if (onlyDigits.length >= 3 && onlyDigits.length <= 10) return { token: onlyDigits }
-      }
-      // Try hash fragment like #1234 or #<uuid>
-      const hash = (url.hash || '').replace(/^#/, '')
-      if (hash) {
-        if (uuidRe.test(hash)) return { orderId: hash }
-        const onlyDigits = hash.replace(/\D+/g, '')
-        if (onlyDigits.length >= 3 && onlyDigits.length <= 10) return { token: onlyDigits }
+        if (cand.startsWith('IARE_')) {
+          console.log('Found encrypted code in URL params:', cand)
+          return { encryptedCode: cand }
+        }
+        if (uuidRe.test(cand)) {
+          console.log('Found UUID in URL params:', cand)
+          return { orderId: cand }
+        }
+        const urlDigits = cand.replace(/\D+/g, '')
+        if (urlDigits.length >= 3 && urlDigits.length <= 10) {
+          console.log('Found token in URL params:', urlDigits)
+          return { token: urlDigits }
+        }
       }
     } catch (_) { /* not a URL */ }
-    const uuidMatch = cleaned.match(uuidRe)
-    if (uuidMatch) return { orderId: uuidMatch[0] }
-    // extract first 3-6 digit token
-    const tokenRe = /(token|token_no|tk|t|id|ord|order|#|^|\b)\D*([0-9]{1,12})/i
-    const m = cleaned.match(tokenRe)
-    if (m) return { token: m[2] }
-    // if plain digits
-    const digits = cleaned.replace(/\D+/g, '')
-    if (digits.length >= 3 && digits.length <= 10) return { token: digits }
+    
+    console.log('No valid token, ID, or encrypted code found in:', cleaned)
     return {}
   }
 
   const fetchOrderForScan = async (text) => {
     setError(null)
     setOrder(null)
-    const { token, orderId } = parseTokenOrId(text)
+    const { token, orderId, encryptedCode } = parseTokenOrId(text)
+    console.log('Parsed token:', token, 'orderId:', orderId, 'encryptedCode:', encryptedCode)
+    
     try {
       let found = null
-      let resolvedToken = token || null
-      if (token) {
-        // Prefer direct lookup on orders table by order_token/token_no
-        const tokenStr = String(token)
-        const tokenNum = Number.isFinite(Number(tokenStr)) ? Number(tokenStr) : null
-        // 1) orders.order_token as string
-        if (!found) {
-          const { data } = await supabase
+      
+              // First, try to find by encrypted code (highest priority)
+        if (encryptedCode) {
+          console.log('Searching by encrypted code:', encryptedCode)
+          const { data, error } = await supabase
             .from('orders')
-            .select('id,item_name,item_count,order_token,created_at,status,price,total,order_placer')
-            .eq('order_token', tokenStr)
+            .select('id,item_name,item_count,order_token,encrypted_code,created_at,status,total_amount,order_placer')
+            .eq('encrypted_code', encryptedCode)
             .limit(1)
             .maybeSingle()
-          if (data) {
-            resolvedToken = data.order_token || tokenStr
-            found = { ...data, token_no: resolvedToken, order_token: resolvedToken }
-          }
+        
+        if (error) {
+          console.error('Error searching by encrypted code:', error)
+          throw error
         }
-        // 2) orders.order_token as number
-        if (!found && tokenNum != null) {
-          const { data } = await supabase
-            .from('orders')
-            .select('id,item_name,item_count,order_token,created_at,status,price,total,order_placer')
-            .eq('order_token', tokenNum)
-            .limit(1)
-            .maybeSingle()
-          if (data) {
-            resolvedToken = data.order_token || tokenStr
-            found = { ...data, token_no: resolvedToken, order_token: resolvedToken }
-          }
-        }
-        // Removed token_no direct checks since orders.token_no column doesn't exist
-        // 5) Fallback: mapping table
-        if (!found) {
-          try {
-            const { data: tokRow } = await supabase
-              .from('order_token')
-              .select('order_id, order_token, token, token_no, token_number')
-              .or(`order_token.eq.${tokenStr},token.eq.${tokenStr},token_no.eq.${tokenStr},token_number.eq.${tokenStr}`)
-              .limit(1)
-              .maybeSingle()
-            if (tokRow && tokRow.order_id) {
-              const { data: orderRow } = await supabase
-                .from('orders')
-                .select('id,item_name,item_count,order_token,created_at,status,price,total,order_placer')
-                .eq('id', tokRow.order_id)
-                .maybeSingle()
-              if (orderRow) {
-                const tokVal = tokRow.order_token || tokRow.token || tokRow.token_no || tokRow.token_number || tokenStr
-                found = { ...orderRow, token_no: tokVal, order_token: tokVal }
-                resolvedToken = tokVal
-              }
-            }
-          } catch (_) {}
-        }
-        // 6) Last-resort fuzzy match on mapping table (handles prefixes like C-1234)
-        if (!found) {
-          try {
-            const like = `%${tokenStr}%`
-            const { data: fuzzy } = await supabase
-              .from('order_token')
-              .select('order_id, order_token, token, token_no, token_number')
-              .or(`order_token.ilike.${like},token.ilike.${like}`)
-              .limit(1)
-              .maybeSingle()
-            if (fuzzy && fuzzy.order_id) {
-              const { data: orderRow } = await supabase
-                .from('orders')
-                .select('id,item_name,item_count,order_token,token_no,created_at,status,price,total,order_placer')
-                .eq('id', fuzzy.order_id)
-                .maybeSingle()
-              if (orderRow) {
-                const tokVal = fuzzy.order_token || fuzzy.token || fuzzy.token_no || fuzzy.token_number || tokenStr
-                found = { ...orderRow, token_no: tokVal, order_token: tokVal }
-                resolvedToken = tokVal
-              }
-            }
-          } catch (_) {}
+        
+        if (data) {
+          console.log('Found order by encrypted code:', data)
+          found = data
+        } else {
+          console.log('No order found with encrypted code:', encryptedCode)
         }
       }
-      if (!found && orderId) {
-        // Also try if this UUID is stored as orders.order_token
-        if (!found) {
-          const { data: asToken } = await supabase
+      
+              // If not found by encrypted code, try by token number
+        if (!found && token) {
+          console.log('Searching by token:', token)
+          const { data, error } = await supabase
             .from('orders')
-            .select('id,item_name,item_count,order_token,created_at,status,price,total,order_placer')
-            .eq('order_token', orderId)
+            .select('id,item_name,item_count,order_token,encrypted_code,created_at,status,total_amount,order_placer')
+            .eq('order_token', token)
+            .limit(1)
             .maybeSingle()
-          if (asToken) {
-            resolvedToken = asToken.order_token || String(orderId)
-            found = { ...asToken, token_no: resolvedToken, order_token: resolvedToken }
-          }
+        
+        if (error) {
+          console.error('Error searching by token:', error)
+          throw error
         }
-        // Try as direct orders.id next
-        if (!found) {
-          const { data: orderRow, error: orderErr } = await supabase
+        
+        if (data) {
+          console.log('Found order by token:', data)
+          found = data
+        } else {
+          console.log('No order found with token:', token)
+        }
+      }
+      
+              // If not found by token, try by order ID
+        if (!found && orderId) {
+          console.log('Searching by order ID:', orderId)
+          const { data, error } = await supabase
             .from('orders')
-            .select('id,item_name,item_count,order_token,created_at,status,price,total,order_placer')
+            .select('id,item_name,item_count,order_token,encrypted_code,created_at,status,total_amount,order_placer')
             .eq('id', orderId)
+            .limit(1)
             .maybeSingle()
-          if (orderErr) throw orderErr
-          if (orderRow) {
-            // resolve token (prefer orders.order_token)
-            if (orderRow.order_token) {
-              resolvedToken = orderRow.order_token
-              found = { ...orderRow, token_no: resolvedToken, order_token: resolvedToken }
-            } else {
-              const { data: tokRow } = await supabase
-                .from('order_token')
-                .select('order_token, token, token_no, token_number')
-                .eq('order_id', orderRow.id)
-                .maybeSingle()
-              resolvedToken = tokRow?.order_token || tokRow?.token || tokRow?.token_no || tokRow?.token_number || null
-              found = { ...orderRow, token_no: resolvedToken, order_token: resolvedToken }
-            }
-          }
+        
+        if (error) {
+          console.error('Error searching by order ID:', error)
+          throw error
         }
-        // If still not found, it might be order_token.id or order_token.order_token matching the UUID
-        if (!found) {
-          const { data: tokById } = await supabase
-            .from('order_token')
-            .select('order_id, order_token, token, token_no, token_number')
-            .or(`id.eq.${orderId},order_token.eq.${orderId}`)
-            .maybeSingle()
-          if (tokById && tokById.order_id) {
-            const { data: orderRow2 } = await supabase
-              .from('orders')
-              .select('id,item_name,item_count,order_token,created_at,status,price,total,order_placer')
-              .eq('id', tokById.order_id)
-              .maybeSingle()
-            if (orderRow2) {
-              const tokVal = tokById.order_token || tokById.token || tokById.token_no || tokById.token_number || String(orderId)
-              resolvedToken = tokVal
-              found = { ...orderRow2, token_no: tokVal, order_token: tokVal }
-            }
-          }
+        
+        if (data) {
+          console.log('Found order by ID:', data)
+          found = data
+        } else {
+          console.log('No order found with ID:', orderId)
         }
       }
+      
       if (found) {
+        console.log('Setting order:', found)
         setOrder(found)
         return found
       } else {
-        setError(new Error('No order found for scanned code'))
+        const errorMsg = `No order found for scanned code. Encrypted Code: ${encryptedCode}, Token: ${token}, Order ID: ${orderId}`
+        console.log(errorMsg)
+        setError(new Error(errorMsg))
         return null
       }
     } catch (e) {
@@ -2385,7 +2371,7 @@ function QRScanPage() {
     if (!order) return
     setUpdating(true)
     try {
-      const { error } = await supabase.rpc('update_order_status', {
+      const { error } = await supabase.rpc('update_order_status_flexible', {
         p_order_id: order.id,
         p_new_status: String(next).toLowerCase(),
       })
@@ -2412,6 +2398,52 @@ function QRScanPage() {
         <div className="actions" style={{ marginBottom: 8 }}>
           <button className="btn" onClick={scanning ? stop : start}>{scanning ? 'Stop' : 'Start'} Camera</button>
         </div>
+        
+        {/* Manual Input for Testing */}
+        <div style={{ marginBottom: 16, padding: 12, backgroundColor: '#f8fafc', borderRadius: 8, border: '1px solid #e2e8f0' }}>
+          <h4 style={{ margin: '0 0 8px 0', fontSize: '14px' }}>Manual Test Input</h4>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <input 
+              type="text" 
+              placeholder="Enter barcode/QR code manually for testing..."
+              style={{ 
+                flex: 1, 
+                padding: '8px 12px', 
+                border: '1px solid #d1d5db', 
+                borderRadius: '4px',
+                fontSize: '14px'
+              }}
+              onKeyPress={(e) => {
+                if (e.key === 'Enter') {
+                  const text = e.target.value.trim()
+                  if (text) {
+                    console.log('Manual input:', text)
+                    fetchOrderForScan(text)
+                    e.target.value = ''
+                  }
+                }
+              }}
+            />
+            <button 
+              className="btn"
+              onClick={(e) => {
+                const input = e.target.previousElementSibling
+                const text = input.value.trim()
+                if (text) {
+                  console.log('Manual input:', text)
+                  fetchOrderForScan(text)
+                  input.value = ''
+                }
+              }}
+              style={{ fontSize: '12px', padding: '8px 12px' }}
+            >
+              Test
+            </button>
+          </div>
+          <div style={{ fontSize: '12px', color: '#6b7280', marginTop: 4 }}>
+            Enter an encrypted code (starts with IARE_), token number (e.g., 1234), or order ID, then press Enter or click Test
+          </div>
+        </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
           <div>
             <video ref={videoRef} style={{ width: '100%', maxHeight: 320, background: '#000', borderRadius: 8 }} muted playsInline />
@@ -2427,7 +2459,9 @@ function QRScanPage() {
                   <div>Item Name: <strong>{order.item_name || 'Order Item'}</strong></div>
                   <div>Item Count: {order.item_count != null ? order.item_count : (order.qty != null ? order.qty : 1)}</div>
                   <div>Status: {normStatus(order.status)}</div>
-                  <div>Price: {order.price != null ? `₹${order.price}` : (order.total != null ? `₹${order.total}` : '-')}</div>
+                  <div>Price: {order.total_amount != null ? `₹${order.total_amount}` : '-'}</div>
+                  <div>Token: {order.order_token ? `#${order.order_token}` : 'Not available'}</div>
+                  <div>Encrypted Code: <code style={{ fontSize: '12px', backgroundColor: '#f3f4f6', padding: '2px 4px', borderRadius: '3px' }}>{order.encrypted_code || 'Not available'}</code></div>
                   <div>Placed By: {order.order_placer === 'admin' ? 'Counter' : 'Student'}</div>
                 </div>
                 <div className="actions">
@@ -2449,7 +2483,7 @@ function QRScanPage() {
           </div>
         </div>
         <div className="muted" style={{ marginTop: 8 }}>
-          Tip: Your QR can contain either the order token (e.g., #1234) or the exact order UUID.
+          Tip: Your QR can contain encrypted codes (IARE_...), order tokens (e.g., #1234), or order UUIDs.
         </div>
       </Card>
     </div>
