@@ -747,10 +747,8 @@ function PlaceOrderPage() {
     
     setPlacingOrderId(item.id)
     try {
-      // Generate a unique order ID using timestamp and random number
-      const timestamp = Date.now()
-      const random = Math.floor(Math.random() * 1000)
-      const orderId = `order_${timestamp}_${random}`
+      // Generate a unique UUID for the order ID
+      const orderId = crypto.randomUUID()
       
       // Generate a unique 4-digit token
       const token = Math.floor(1000 + Math.random() * 9000).toString()
@@ -786,6 +784,10 @@ function PlaceOrderPage() {
       
       if (error) {
         console.error('Failed to insert order:', error)
+        // Check if it's a UUID format error
+        if (error.message && error.message.includes('uuid')) {
+          throw new Error('Database configuration error: Please check your Supabase table structure')
+        }
         throw error
       }
       
