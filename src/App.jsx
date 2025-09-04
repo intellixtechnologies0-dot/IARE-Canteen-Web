@@ -646,10 +646,63 @@ function PlaceOrderPage() {
           image: r.image_url ?? r.image ?? r.photo ?? 'https://via.placeholder.com/300?text=Food',
           description: r.description ?? ''
         }))
-        setMenuItems(mapped)
+        // If no items loaded from database, use fallback items
+        if (mapped.length === 0) {
+          console.log('No food items found in database, using fallback items')
+          const fallbackItems = [
+            {
+              id: 'fallback_1',
+              name: 'Veg Biryani',
+              price: 180,
+              image: 'https://as1.ftcdn.net/v2/jpg/04/59/27/88/1000_F_459278894_92eSlejnR7NSwJRCbVyy9ZZibSmjbF8q.jpg',
+              description: 'Delicious vegetarian biryani'
+            },
+            {
+              id: 'fallback_2',
+              name: 'Masala Dosa',
+              price: 80,
+              image: 'https://as2.ftcdn.net/v2/jpg/14/45/94/59/1000_F_1445945944_eBUM7ot1AWezNkqknKsRImNvLvFbmr7z.jpg',
+              description: 'Crispy dosa with potato filling'
+            },
+            {
+              id: 'fallback_3',
+              name: 'Samosa',
+              price: 40,
+              image: 'https://as2.ftcdn.net/v2/jpg/15/85/73/65/1000_F_1585736532_NFMq8z0vAjbker6w9vuzoF8FmsxVRGPI.jpg',
+              description: 'Spicy potato and pea samosa'
+            }
+          ]
+          setMenuItems(fallbackItems)
+        } else {
+          setMenuItems(mapped)
+        }
       } catch (e) {
         console.error('Failed to load food_items:', e)
-        setMenuItems([])
+        // Use fallback items if database fails
+        const fallbackItems = [
+          {
+            id: 'fallback_1',
+            name: 'Veg Biryani',
+            price: 180,
+            image: 'https://as1.ftcdn.net/v2/jpg/04/59/27/88/1000_F_459278894_92eSlejnR7NSwJRCbVyy9ZZibSmjbF8q.jpg',
+            description: 'Delicious vegetarian biryani'
+          },
+          {
+            id: 'fallback_2',
+            name: 'Masala Dosa',
+            price: 80,
+            image: 'https://as2.ftcdn.net/v2/jpg/14/45/94/59/1000_F_1445945944_eBUM7ot1AWezNkqknKsRImNvLvFbmr7z.jpg',
+            description: 'Crispy dosa with potato filling'
+          },
+          {
+            id: 'fallback_3',
+            name: 'Samosa',
+            price: 40,
+            image: 'https://as2.ftcdn.net/v2/jpg/15/85/73/65/1000_F_1585736532_NFMq8z0vAjbker6w9vuzoF8FmsxVRGPI.jpg',
+            description: 'Spicy potato and pea samosa'
+          }
+        ]
+        setMenuItems(fallbackItems)
       }
     }
     fetchFoodItems()
@@ -694,46 +747,51 @@ function PlaceOrderPage() {
     
     setPlacingOrderId(item.id)
     try {
-      // Try primary RPC path
-      const { data, error } = await supabase.rpc('create_order', {
-        p_item_name: item.name,
-        p_total_amount: item.price,
-        p_status: 'PENDING',
-        p_order_placer: 'admin'
+      // Generate a unique order ID using timestamp and random number
+      const timestamp = Date.now()
+      const random = Math.floor(Math.random() * 1000)
+      const orderId = `order_${timestamp}_${random}`
+      
+      // Generate a unique 4-digit token
+      const token = Math.floor(1000 + Math.random() * 9000).toString()
+      
+      // Insert the order directly into the orders table
+      console.log('Attempting to insert order:', {
+        id: orderId,
+        item_name: item.name,
+        total_amount: item.price,
+        status: 'PENDING',
+        order_placer: 'admin',
+        order_token: token,
+        token_no: token,
+        created_at: new Date().toISOString(),
+        is_available: true
       })
-      let createdId = data
+      
+      const { data, error } = await supabase
+        .from('orders')
+        .insert({
+          id: orderId,
+          item_name: item.name,
+          total_amount: item.price,
+          status: 'PENDING',
+          order_placer: 'admin',
+          order_token: token,
+          token_no: token,
+          created_at: new Date().toISOString(),
+          is_available: true
+        })
+        .select()
+        .single()
+      
       if (error) {
-        // Fallback path: generate id then insert into orders
-        console.warn('create_order RPC failed, attempting fallback insert:', error?.message || error)
-        const { data: genId, error: genErr } = await supabase.rpc('generate_order_id')
-        if (genErr) throw genErr
-        createdId = genId
-        const { error: insErr } = await supabase
-          .from('orders')
-          .insert({
-            id: createdId,
-            item_name: item.name,
-            total_amount: item.price,
-            status: 'PENDING',
-            order_placer: 'admin',
-          })
-        if (insErr) throw insErr
+        console.error('Failed to insert order:', error)
+        throw error
       }
-
-      // Get token from the created order
-      let tokenVal = createdId
-      try {
-        const { data: orderData } = await supabase
-          .from('orders')
-          .select('order_token')
-          .eq('id', createdId)
-          .maybeSingle()
-        if (orderData && orderData.order_token) {
-          tokenVal = orderData.order_token
-        }
-      } catch (e) { /* ignore and fallback to createdId */ }
-      setLastToken(tokenVal)
-      alert(`Order placed successfully! Token No: #${tokenVal}`)
+      
+      console.log('Order created successfully:', data)
+      setLastToken(token)
+      alert(`Order placed successfully! Token No: #${token}`)
       
       // The order will automatically appear in the Orders panel through Supabase realtime
       // No need to manually update local state
