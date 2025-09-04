@@ -1618,7 +1618,7 @@ function ReportsPage() {
     // Calculate revenue from delivered items - use total_amount, total, or price
     const itemRevenue = r.total_amount || r.total || r.price || 0
     acc.revenue += Number(itemRevenue) || 0
-    acc.items += r.qty
+    acc.items += 1
     acc[r.status] = (acc[r.status] || 0) + 1
     return acc
   }, { orders: 0, revenue: 0, items: 0, PENDING: 0, PREPARING: 0, READY: 0 })
@@ -2286,7 +2286,7 @@ function QRScanPage() {
           console.log('Searching by encrypted code:', encryptedCode)
           const { data, error } = await supabase
             .from('orders')
-            .select('id,item_name,item_count,order_token,encrypted_code,created_at,status,total_amount,order_placer')
+            .select('id,item_name,encrypted_code,order_token,created_at,status,total_amount,order_placer')
             .eq('encrypted_code', encryptedCode)
             .limit(1)
             .maybeSingle()
@@ -2309,7 +2309,7 @@ function QRScanPage() {
           console.log('Searching by token:', token)
           const { data, error } = await supabase
             .from('orders')
-            .select('id,item_name,item_count,order_token,encrypted_code,created_at,status,total_amount,order_placer')
+            .select('id,item_name,encrypted_code,order_token,created_at,status,total_amount,order_placer')
             .eq('order_token', token)
             .limit(1)
             .maybeSingle()
@@ -2332,7 +2332,7 @@ function QRScanPage() {
           console.log('Searching by order ID:', orderId)
           const { data, error } = await supabase
             .from('orders')
-            .select('id,item_name,item_count,order_token,encrypted_code,created_at,status,total_amount,order_placer')
+            .select('id,item_name,encrypted_code,order_token,created_at,status,total_amount,order_placer')
             .eq('id', orderId)
             .limit(1)
             .maybeSingle()
@@ -2457,11 +2457,10 @@ function QRScanPage() {
               <div>
                 <div style={{ marginBottom: 8 }}>
                   <div>Item Name: <strong>{order.item_name || 'Order Item'}</strong></div>
-                  <div>Item Count: {order.item_count != null ? order.item_count : (order.qty != null ? order.qty : 1)}</div>
+                  <div>Encrypted Code: <code style={{ fontSize: '12px', backgroundColor: '#f3f4f6', padding: '2px 4px', borderRadius: '3px' }}>{order.encrypted_code || 'Not available'}</code></div>
                   <div>Status: {normStatus(order.status)}</div>
                   <div>Price: {order.total_amount != null ? `₹${order.total_amount}` : '-'}</div>
                   <div>Token: {order.order_token ? `#${order.order_token}` : 'Not available'}</div>
-                  <div>Encrypted Code: <code style={{ fontSize: '12px', backgroundColor: '#f3f4f6', padding: '2px 4px', borderRadius: '3px' }}>{order.encrypted_code || 'Not available'}</code></div>
                   <div>Placed By: {order.order_placer === 'admin' ? 'Counter' : 'Student'}</div>
                 </div>
                 <div className="actions">
